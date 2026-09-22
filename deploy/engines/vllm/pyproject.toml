@@ -1,0 +1,31 @@
+# deepme engine project: vllm
+# Synced to the server at ~/deepme-runtime/vllm via `deepme setup`.
+# Encodes every toolchain fix discovered during bring-up — see comments.
+[project]
+name = "deepme-engine-vllm"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "vllm>=0.26",
+    # Prebuilt flashinfer kernels so nothing JIT-compiles flashinfer ops at
+    # startup. MUST match the flashinfer-python version vllm pins.
+    "flashinfer-jit-cache==0.6.14",
+]
+
+[tool.uv]
+# The pip "cu13" CUDA toolkit dir is merged from separate wheels; engines pin
+# them inconsistently (nvcc 13.3 + cuda-runtime 13.0), which breaks every JIT
+# compiler with CCCL's "compiler and toolkit headers are incompatible" #error.
+# Force the header/runtime wheels onto nvcc's minor version.
+override-dependencies = [
+    "nvidia-cuda-runtime>=13.3,<13.4",
+    "nvidia-cuda-nvrtc>=13.3,<13.4",
+]
+
+[tool.uv.sources]
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true

@@ -1,0 +1,21 @@
+[project]
+name = "deepme"
+version = "0.1.0"
+description = "Infrastructure CLI for deploying and managing DeepSeek-V4-Flash on the 8x5090 inference server"
+readme = "README.md"
+authors = [
+    { name = "Matt Stancliff", email = "matt@genges.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "typer>=0.15",
+    "httpx>=0.28",
+    "rich>=13.0",
+]
+
+[project.scripts]
+deepme = "deepme.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"

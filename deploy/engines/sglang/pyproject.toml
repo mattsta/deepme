@@ -1,0 +1,28 @@
+# deepme engine project: sglang
+# Synced to the server at ~/deepme-runtime/sglang via `deepme setup`.
+# Encodes every toolchain fix discovered during bring-up — see comments.
+[project]
+name = "deepme-engine-sglang"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "sglang[all]>=0.5.17",
+    # Prebuilt flashinfer kernels; MUST match sglang's flashinfer-python pin.
+    "flashinfer-jit-cache==0.6.15.post1",
+]
+
+[tool.uv]
+# See vllm project: align CUDA header/runtime wheels to nvcc's minor version
+# or every JIT stack (tilelang, tvm_ffi, deep_gemm) dies on the CCCL guard.
+override-dependencies = [
+    "nvidia-cuda-runtime>=13.3,<13.4",
+    "nvidia-cuda-nvrtc>=13.3,<13.4",
+]
+
+[tool.uv.sources]
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true
