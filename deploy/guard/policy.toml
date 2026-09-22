@@ -1,0 +1,37 @@
+# Output-guard policy: named rule sets, referenced per-request.
+#
+# Requests control enforcement via a "guard" object in the body:
+#   {"guard": {"enabled": false}}                      bypass entirely
+#   {"guard": {"sets": ["dashes"]}}                    only these sets
+#   {"guard": {"rules": [{"kind":"word","pattern":"x"}]}}  add inline rules
+# Omitted -> default_sets below.
+#
+# Rule kinds: word (isolated word), substring (grapheme/code point anywhere),
+# phrase (multi-word, any whitespace), regex. Per-rule: case_sensitive,
+# The guard never authors text: violations regenerate; exhaustion truncates.
+
+[guard]
+max_retries = 6
+hold_slack = 16
+strip_chars = "*_~`"
+default_sets = ["banned-words", "dashes", "style"]
+
+[sets.banned-words]
+rules = [
+    { kind = "word", pattern = "that" },
+]
+
+[sets.dashes]
+rules = [
+    { kind = "substring", pattern = "—" },  # U+2014 em dash
+    { kind = "substring", pattern = "–" },  # U+2013 en dash
+    { kind = "substring", pattern = "―" },  # U+2015 horizontal bar
+    { kind = "substring", pattern = "‒" },  # U+2012 figure dash
+    { kind = "substring", pattern = "‐" },   # U+2010 hyphen
+    { kind = "substring", pattern = "‑" },   # U+2011 non-breaking hyphen
+]
+
+[sets.style]
+rules = [
+    { kind = "phrase", pattern = "delve into" },
+]

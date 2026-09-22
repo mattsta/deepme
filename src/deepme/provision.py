@@ -48,20 +48,24 @@ def provision(engines: tuple[str, ...] = config.ENGINES) -> str:
     )
     outputs.append(remote.run_script(base, timeout=600).stdout)
 
+    from . import engines as engines_mod
+
     for eng in engines:
+        edef = engines_mod.get(eng)
         pyproject = ENGINE_PROJECTS_DIR / eng / "pyproject.toml"
         if not pyproject.exists():
             raise FileNotFoundError(f"no engine project: {pyproject}")
         edir = config.engine_dir(eng)
         remote.run(f"mkdir -p {edir}")
         remote.write_remote_file(f"{edir}/pyproject.toml", pyproject.read_text())
+        sync_env = " ".join(f"{k}={v!r}" for k, v in edef.sync_env.items())
         sync = "\n".join(
             [
                 "set -euo pipefail",
                 f"export PATH={config.REMOTE_HOME}/.local/bin:$PATH",
                 f"cd {edir}",
                 f"echo '=== uv sync {eng} ==='",
-                f"uv sync -p {config.ENGINE_PYTHON} 2>&1 | tail -3",
+                f"env {sync_env} uv sync -p {config.ENGINE_PYTHON} 2>&1 | tail -3",
                 _post_sync_fixups(eng),
                 f"echo '=== {eng} key packages ==='",
                 "uv pip list --python .venv/bin/python | "

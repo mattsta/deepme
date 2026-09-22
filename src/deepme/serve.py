@@ -1,126 +1,110 @@
-"""Build engine launch commands and manage the inference service via systemd.
+"""Build engine launch commands and manage inference services via systemd.
 
-The service runs as a transient-free, persistent systemd unit so it survives
-SSH disconnects and can be inspected with journalctl. Each `start` rewrites
-the unit file from the current ServeOptions, so iterating on flags is just
-`uv run deepme serve start --engine ... --extra ...` again.
+Each model profile gets its own unit (deepme-llm-<profile>) pinned to its
+GPU set and port, so multiple models can coexist when their GPU sets don't
+overlap. Every `start` rewrites the unit from the resolved RunSpec —
+iterating on flags is just editing the profile (or CLI overrides) and
+re-running `deepme serve start`.
 """
 
 from __future__ import annotations
 
-import json
 import shlex
 import time
 
 import httpx
 
 from . import config, remote
-from .config import ServeOptions
+from .profiles import RunSpec
 
-UNIT_PATH = f"/etc/systemd/system/{config.SYSTEMD_UNIT}.service"
+UNIT_PREFIX = "deepme-llm"
+LEGACY_UNITS = ("deepme-llm",)  # pre-profile single unit; stopped on conflict
 
 
-def build_command(opts: ServeOptions) -> list[str]:
-    """Translate ServeOptions into the engine's CLI invocation.
+def _resolve_model_file(spec: RunSpec) -> RunSpec:
+    """For file-based formats (gguf), resolve the concrete weight file on the
+    server (variant name, or the single .gguf present) into spec.model_file."""
+    if spec.format != "gguf":
+        return spec
+    import dataclasses
 
-    Flag choices follow the DeepSeek-V4-Flash-0731 model card, adapted for
-    8x RTX 5090: weights are ~167GB FP8 so we shard across all 8 GPUs with
-    tensor parallelism (the card's examples assume larger datacenter GPUs).
-    """
-    key = config.api_key()
-    if opts.engine == "sglang":
-        cmd = [
-            config.venv_python("sglang"),
-            "-m",
-            "sglang.launch_server",
-            "--model-path",
-            config.MODEL_PATH,
-            "--served-model-name",
-            config.SERVED_MODEL_NAME,
-            "--trust-remote-code",
-            "--tp",
-            str(opts.tp),
-            "--context-length",
-            str(opts.max_model_len),
-            "--mem-fraction-static",
-            str(opts.gpu_mem_util),
-            "--chunked-prefill-size",
-            "4096",
-            "--moe-runner-backend",
-            "flashinfer_mxfp4",
-            "--swa-full-tokens-ratio",
-            "0.1",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            str(config.API_PORT),
-            "--api-key",
-            key,
-        ]
-        if opts.spec_decode:
-            cmd += ["--speculative-algorithm", "DSPARK"]
-        if opts.kv_ram_gb:
-            # HiCache: hierarchical KV cache tiered into system RAM.
-            cmd += [
-                "--enable-hierarchical-cache",
-                "--hicache-size",
-                str(opts.kv_ram_gb),
-            ]
-    elif opts.engine == "vllm":
-        cmd = [
-            f"{config.engine_venv('vllm')}/bin/vllm",
-            "serve",
-            config.MODEL_PATH,
-            "--served-model-name",
-            config.SERVED_MODEL_NAME,
-            "--trust-remote-code",
-            "--tensor-parallel-size",
-            str(opts.tp),
-            "--enable-expert-parallel",
-            "--max-model-len",
-            str(opts.max_model_len),
-            "--gpu-memory-utilization",
-            str(opts.gpu_mem_util),
-            "--kv-cache-dtype",
-            "fp8",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            str(config.API_PORT),
-            "--api-key",
-            key,
-        ]
-        if opts.spec_decode:
-            spec = {
-                "method": "dspark",
-                "num_speculative_tokens": opts.spec_tokens,
-                "draft_sample_method": "greedy",
-            }
-            cmd += ["--speculative-config", json.dumps(spec)]
-        if opts.kv_ram_gb:
-            # OffloadingConnector: spill evicted KV blocks to CPU RAM and
-            # restore on prefix-cache hits (needs prefix caching, default on).
-            kv_cfg = {
-                "kv_connector": "OffloadingConnector",
-                "kv_role": "kv_both",
-                "kv_connector_extra_config": {
-                    "cpu_bytes_to_use": opts.kv_ram_gb * 1024**3,
-                },
-            }
-            cmd += ["--kv-transfer-config", json.dumps(kv_cfg)]
-    else:
-        raise ValueError(
-            f"unknown engine {opts.engine!r}; choose from {config.ENGINES}"
+    pattern = spec.variant or "*.gguf"
+    r = remote.run(f"ls {spec.model_path}/{pattern} 2>/dev/null | head -1", check=False)
+    path = r.stdout.strip()
+    if not path:
+        raise SystemExit(
+            f"no gguf file matching {pattern!r} under {spec.model_path} — "
+            f"is the download complete?"
         )
-    cmd += opts.extra_args
+    return dataclasses.replace(spec, model_file=path)
+
+
+def build_command(spec: RunSpec) -> list[str]:
+    """Delegate to the engine registry; append profile + CLI args.
+
+    Engine-specific logic lives in engines.py EngineDefs — this layer only
+    validates and composes.
+    """
+    from . import engines as engines_mod
+
+    eng = engines_mod.get(spec.engine)
+    err = eng.validate_spec(spec)
+    if err:
+        raise SystemExit(f"invalid spec for engine {spec.engine}: {err}")
+    cmd = eng.build_command(spec, config.api_key())
+    cmd += list(spec.engine_args)
+    cmd += list(spec.extra_args)
     return cmd
 
 
-def start(opts: ServeOptions) -> None:
-    exec_line = " ".join(shlex.quote(a) for a in build_command(opts))
+def _running_units() -> list[str]:
+    r = remote.run(
+        f"systemctl list-units --no-legend --plain '{UNIT_PREFIX}*' "
+        "| awk '{print $1}' | sed 's/\\.service//'",
+        check=False,
+    )
+    return [u for u in r.stdout.split() if u]
+
+
+def _stop_conflicting(spec: RunSpec) -> list[str]:
+    """Stop units whose GPU sets (or port) overlap the one we're starting.
+
+    Unit files carry an X-DEEPME-GPUS comment so overlap is decided from the
+    server's actual state, not local assumptions. Legacy units count as
+    all-GPUs.
+    """
+    stopped = []
+    for unit in _running_units():
+        if unit == spec.unit or unit in LEGACY_UNITS:
+            overlap = True
+        else:
+            r = remote.run(
+                f"grep -oP '(?<=X-DEEPME-GPUS=)[0-9,]+' "
+                f"/etc/systemd/system/{unit}.service 2>/dev/null",
+                check=False,
+            )
+            gpus = {int(g) for g in r.stdout.strip().split(",") if g.strip().isdigit()}
+            overlap = bool(gpus & set(spec.gpus)) if gpus else True
+        if overlap:
+            remote.run(f"sudo systemctl stop {unit} 2>/dev/null || true", check=False)
+            stopped.append(unit)
+    return stopped
+
+
+def start(spec: RunSpec) -> list[str]:
+    """Deploy a RunSpec; returns any units stopped to free its GPUs/port."""
+    err = spec.fit_check()
+    if err:
+        raise SystemExit(f"fit check failed for {spec.profile}: {err}")
+    spec = _resolve_model_file(spec)
+    stopped = _stop_conflicting(spec)
+    exec_line = " ".join(shlex.quote(a) for a in build_command(spec))
+    gpus_csv = ",".join(str(g) for g in spec.gpus)
     unit = f"""\
+# X-DEEPME-GPUS={gpus_csv}
+# X-DEEPME-PROFILE={spec.profile}
 [Unit]
-Description=deepme LLM inference ({opts.engine}, {config.SERVED_MODEL_NAME})
+Description=deepme LLM inference ({spec.profile}: {spec.engine}, {spec.served_name})
 After=network-online.target
 StartLimitIntervalSec=600
 StartLimitBurst=3
@@ -129,8 +113,9 @@ StartLimitBurst=3
 User={config.SSH_USER}
 Environment=HF_HOME={config.REMOTE_HOME}/.cache/huggingface
 Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
-Environment=CUDA_HOME={config.venv_cuda_home(opts.engine)}
-Environment=PATH={config.engine_venv(opts.engine)}/bin:{config.venv_cuda_home(opts.engine)}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CUDA_VISIBLE_DEVICES={gpus_csv}
+Environment=CUDA_HOME={config.venv_cuda_home(spec.engine)}
+Environment=PATH={config.engine_venv(spec.engine)}/bin:{config.venv_cuda_home(spec.engine)}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart={exec_line}
 Restart=on-failure
 RestartSec=10
@@ -141,26 +126,36 @@ TimeoutStopSec=60
 [Install]
 WantedBy=multi-user.target
 """
-    remote.write_remote_file(UNIT_PATH, unit, sudo=True)
+    remote.write_remote_file(
+        f"/etc/systemd/system/{spec.unit}.service", unit, sudo=True
+    )
     remote.run(
-        f"sudo systemctl daemon-reload && sudo systemctl restart {config.SYSTEMD_UNIT}"
+        f"sudo systemctl daemon-reload && sudo systemctl reset-failed {spec.unit} "
+        f"2>/dev/null; sudo systemctl restart {spec.unit}"
+    )
+    return stopped
+
+
+def stop(spec: RunSpec) -> None:
+    remote.run(f"sudo systemctl stop {spec.unit}", check=False)
+
+
+def restart(spec: RunSpec) -> None:
+    remote.run(
+        f"sudo systemctl reset-failed {spec.unit} 2>/dev/null;"
+        f" sudo systemctl restart {spec.unit}"
     )
 
 
-def stop() -> None:
-    remote.run(f"sudo systemctl stop {config.SYSTEMD_UNIT}", check=False)
-
-
-def unit_state() -> str:
-    r = remote.run(f"systemctl is-active {config.SYSTEMD_UNIT}", check=False)
+def unit_state(spec: RunSpec) -> str:
+    r = remote.run(f"systemctl is-active {spec.unit}", check=False)
     return r.stdout.strip() or r.stderr.strip() or "unknown"
 
 
-def health() -> tuple[bool, str]:
-    """Probe the OpenAI-compatible server's health endpoint from here."""
+def health(spec: RunSpec) -> tuple[bool, str]:
     try:
         r = httpx.get(
-            f"{config.API_BASE}/health",
+            f"{spec.api_base}/health",
             timeout=5,
             headers={"Authorization": f"Bearer {config.api_key()}"},
         )
@@ -169,32 +164,27 @@ def health() -> tuple[bool, str]:
         return False, type(exc).__name__
 
 
-def wait_healthy(timeout_s: float = 1800, poll_s: float = 10) -> tuple[bool, str]:
-    """Wait for the server to come up (weight loading takes minutes).
-
-    Returns (ok, reason); on failure the reason includes a log excerpt.
-    """
+def wait_healthy(
+    spec: RunSpec, timeout_s: float = 1800, poll_s: float = 10
+) -> tuple[bool, str]:
+    """Wait for the server to come up; on failure, include a log diagnosis."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        ok, _ = health()
+        ok, _ = health(spec)
         if ok:
             return True, "healthy"
-        state = unit_state()
+        state = unit_state(spec)
         if state in ("failed", "inactive", "dead"):
-            return False, f"service is {state}\n" + diagnose()
+            return False, f"service is {state}\n" + diagnose(spec)
         time.sleep(poll_s)
-    return False, f"timed out after {timeout_s}s\n" + diagnose()
+    return False, f"timed out after {timeout_s}s\n" + diagnose(spec)
 
 
-def diagnose(lines: int = 3000) -> str:
-    """Summarize service health: restart count and the real crash evidence.
-
-    The engines log benign lines containing 'error' (e.g. "Ignore import
-    error"), so we filter those out and surface tracebacks/exit reasons.
-    """
+def diagnose(spec: RunSpec, lines: int = 3000) -> str:
+    """Restart count + the log window before the last crash (noise filtered)."""
     script = f"""\
-echo "restarts=$(systemctl show -p NRestarts --value {config.SYSTEMD_UNIT}) state=$(systemctl is-active {config.SYSTEMD_UNIT})"
-sudo journalctl -u {config.SYSTEMD_UNIT} -n {lines} --no-pager -o cat \\
+echo "restarts=$(systemctl show -p NRestarts --value {spec.unit}) state=$(systemctl is-active {spec.unit})"
+sudo journalctl -u {spec.unit} -n {lines} --no-pager -o cat \\
   | grep -v 'Ignore import error' \\
   | awk '/Main process exited|Failed with result/ {{n=NR}} {{l[NR]=$0}} END {{ if (n==0) n=NR; s=n-45; if (s<1) s=1; for (i=s; i<=n; i++) print l[i] }}'
 """
@@ -202,19 +192,24 @@ sudo journalctl -u {config.SYSTEMD_UNIT} -n {lines} --no-pager -o cat \\
     return r.stdout.strip() or "(no logs)"
 
 
-def restart() -> None:
-    """Clear failure state and restart the existing unit unchanged."""
-    remote.run(
-        f"sudo systemctl reset-failed {config.SYSTEMD_UNIT} 2>/dev/null;"
-        f" sudo systemctl restart {config.SYSTEMD_UNIT}"
-    )
-
-
-def tail_logs(lines: int = 100, follow: bool = False) -> None:
+def tail_logs(spec: RunSpec, lines: int = 100, follow: bool = False) -> None:
     flags = f"-n {lines}" + (" -f" if follow else "")
     remote.run(
-        f"sudo journalctl -u {config.SYSTEMD_UNIT} {flags} --no-pager",
+        f"sudo journalctl -u {spec.unit} {flags} --no-pager",
         stream=True,
         timeout=None,
         check=False,
     )
+
+
+def fleet_status() -> str:
+    """One line per deepme unit on the server: profile, state, gpus."""
+    script = f"""\
+for f in /etc/systemd/system/{UNIT_PREFIX}*.service; do
+  [ -e "$f" ] || continue
+  u=$(basename "$f" .service)
+  gpus=$(grep -oP '(?<=X-DEEPME-GPUS=)[0-9,]+' "$f" 2>/dev/null || echo '?')
+  echo "$u state=$(systemctl is-active $u) gpus=$gpus"
+done
+"""
+    return remote.run_script(script, check=False).stdout.strip() or "(no units)"

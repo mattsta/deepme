@@ -1,69 +1,78 @@
-"""Download model weights onto the server.
+"""Download model weights onto the server, driven by a RunSpec.
 
-The download runs on the server inside a detached tmux session (167GB —
-it must survive our SSH session), using `hf download` with hf_transfer
-for maximum throughput. `hf download` resumes cleanly, so re-running is
-always safe.
+Runs on the server inside a detached tmux session (per model — downloads
+survive our SSH session and can proceed in parallel), using `hf download`
+with hf_transfer. Resumes cleanly; re-running is always safe. Completeness
+is judged against the shard count reported by the Hugging Face API.
 """
 
 from __future__ import annotations
 
 from . import config, remote
+from .profiles import RunSpec
 
-TMUX_SESSION = "deepme-download"
-LOG = f"{config.REMOTE_HOME}/deepme-download.log"
+
+def _session(spec: RunSpec) -> str:
+    return f"deepme-dl-{spec.profile}"
+
+
+def _log(spec: RunSpec) -> str:
+    return f"{config.REMOTE_HOME}/deepme-download-{spec.profile}.log"
+
 
 # HF CDN throttles to ~5MB/s per connection from this box; high worker count
-# (plus hf_transfer's chunked transfers) is what makes the 167GB fetch tolerable.
+# (plus hf_transfer's chunked transfers) is what makes 100GB+ fetches tolerable.
 MAX_WORKERS = 24
 
 
-def restart() -> None:
-    """Kill any running download session and start fresh (download resumes)."""
-    remote.run(f"tmux kill-session -t {TMUX_SESSION} 2>/dev/null || true", check=False)
-    start()
-
-
-def start() -> None:
+def start(spec: RunSpec) -> str:
+    session, log = _session(spec), _log(spec)
     inner = (
         f"export PATH={config.REMOTE_HOME}/.local/bin:$PATH HF_HUB_ENABLE_HF_TRANSFER=1; "
-        f"uvx --from 'huggingface_hub[hf_transfer]' hf download {config.MODEL_REPO} "
-        f"--local-dir {config.MODEL_PATH} --max-workers {MAX_WORKERS} 2>&1 | tee {LOG}; "
-        f"echo DOWNLOAD_EXIT=$? >> {LOG}"
+        f"uvx --from 'huggingface_hub[hf_transfer]' hf download {spec.repo} "
+        f"--local-dir {spec.model_path} --max-workers {MAX_WORKERS} 2>&1 | tee {log}; "
+        f"echo DOWNLOAD_EXIT=$? >> {log}"
     )
     script = f"""\
 set -euo pipefail
 mkdir -p {config.REMOTE_MODELS_DIR}
-if tmux has-session -t {TMUX_SESSION} 2>/dev/null; then
+if tmux has-session -t {session} 2>/dev/null; then
   echo "download session already running"
 else
-  tmux new-session -d -s {TMUX_SESSION} {remote_quote(inner)}
-  echo "download started in tmux session {TMUX_SESSION}"
+  tmux new-session -d -s {session} {_quote(inner)}
+  echo "download started in tmux session {session}"
 fi
 """
-    print(remote.run_script(script).stdout.strip())
+    return remote.run_script(script).stdout.strip()
 
 
-def remote_quote(s: str) -> str:
-    return "'" + s.replace("'", "'\\''") + "'"
+def restart(spec: RunSpec) -> str:
+    """Kill any running session for this model and start fresh (resumes)."""
+    remote.run(
+        f"tmux kill-session -t {_session(spec)} 2>/dev/null || true", check=False
+    )
+    return start(spec)
 
 
-def status() -> str:
+def status(spec: RunSpec) -> str:
     script = f"""\
 active=no
-tmux has-session -t {TMUX_SESSION} 2>/dev/null && active=yes
-size=$(du -sBG {config.MODEL_PATH} 2>/dev/null | cut -f1 || echo 0G)
-echo "session_active=$active downloaded=$size target=~{config.MODEL_SIZE_GB}G"
-tail -2 {LOG} 2>/dev/null || true
-n=$(ls {config.MODEL_PATH}/*.safetensors 2>/dev/null | wc -l)
-echo "safetensors_shards=$n/48"
+tmux has-session -t {_session(spec)} 2>/dev/null && active=yes
+size=$(du -s --block-size=1G {spec.model_path} 2>/dev/null | cut -f1 || echo 0)
+n=$(ls {spec.model_path}/*.safetensors 2>/dev/null | wc -l)
+echo "session_active=$active downloaded=${{size}}GiB (~{spec.weight_gib:.0f}GiB weights expected) shards=$n/{spec.shards}"
+tail -2 {_log(spec)} 2>/dev/null || true
 """
     return remote.run_script(script, check=False).stdout
 
 
-def is_complete() -> bool:
+def is_complete(spec: RunSpec) -> bool:
     script = f"""\
-n=$(ls {config.MODEL_PATH}/*.safetensors 2>/dev/null | wc -l)
-grep -q DOWNLOAD_EXIT=0 {LOG} 2>/dev/null && [ "$n" -ge 48 ] && echo COMPLETE || echo INCOMPLETE
+n=$(ls {spec.model_path}/*.safetensors 2>/dev/null | wc -l)
+[ "$n" -ge {spec.shards} ] && [ "{spec.shards}" -gt 0 ] && echo COMPLETE || echo INCOMPLETE
 """
     return "COMPLETE" in remote.run_script(script, check=False).stdout
+
+
+def _quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"

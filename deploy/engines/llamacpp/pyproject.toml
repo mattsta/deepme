@@ -1,0 +1,14 @@
+# deepme engine project: llama.cpp (GGUF serving) — EXPERIMENTAL
+# Synced to ~/deepme-runtime/llamacpp via `deepme setup -e llamacpp`.
+# Built from source with CUDA (sync env CMAKE_ARGS=-DGGML_CUDA=on comes from
+# the engine registry, engines.py); the venv's cu13 toolkit provides nvcc.
+[project]
+name = "deepme-engine-llamacpp"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "llama-cpp-python[server]",
+    # CUDA toolchain for the source build (nvcc/ptxas/headers in nvidia/cu13)
+    "nvidia-cuda-nvcc>=13.3,<13.4",
+    "nvidia-cuda-runtime>=13.3,<13.4",
+]

@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 import secrets
 import tomllib
-from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -80,29 +79,14 @@ def venv_cuda_home(engine: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Model
+# Engines
+#
+# Model identity/serving parameters live in profiles (deploy/models/*.toml,
+# see profiles.py) — nothing model-specific belongs in this module.
 # ---------------------------------------------------------------------------
 
-MODEL_REPO = "deepseek-ai/DeepSeek-V4-Flash-0731"
-MODEL_NAME = "DeepSeek-V4-Flash-0731"  # directory name on the server
-SERVED_MODEL_NAME = "deepseek-v4-flash"  # name exposed via the OpenAI API
-MODEL_PATH = f"{REMOTE_MODELS_DIR}/{MODEL_NAME}"
-MODEL_SIZE_GB = 167  # approximate total safetensors size, used for progress
-
-# Recommended sampling defaults from the model card
-DEFAULT_TEMPERATURE = 1.0
-DEFAULT_TOP_P = 0.95  # agentic scenarios; 1.0 otherwise
-
-# ---------------------------------------------------------------------------
-# Serving
-# ---------------------------------------------------------------------------
-
-API_PORT = int(os.environ.get("DEEPME_PORT") or _server.get("port", 8000))
-API_BASE = f"http://{SSH_HOST}:{API_PORT}"
-SYSTEMD_UNIT = "deepme-llm"
-
-# Engines we know how to install and launch. Each gets its own uv-managed
-# venv on the server so they never fight over torch/flashinfer versions.
+# Engines we know how to install and launch. Each is a uv project on the
+# server so they never fight over torch/flashinfer versions.
 ENGINES = ("sglang", "vllm")
 # vllm is the production engine: sglang 0.5.17's DSpark draft autotune hits an
 # unsupported sparse-MLA kernel shape on SM120 (as does vllm 0.26's DSpark) —
@@ -112,21 +96,6 @@ DEFAULT_ENGINE = "vllm"
 
 def venv_python(engine: str) -> str:
     return f"{engine_venv(engine)}/bin/python"
-
-
-@dataclass
-class ServeOptions:
-    """Tunable knobs for a serve deployment; defaults follow the model card
-    adapted to 8x RTX 5090 (32GB, PCIe, no NVLink -> full TP across 8)."""
-
-    engine: str = DEFAULT_ENGINE
-    tp: int = 8
-    max_model_len: int = 262_144  # 1M supported; capped for KV headroom
-    gpu_mem_util: float = 0.90
-    spec_decode: bool = True  # DSpark, num_speculative_tokens=7
-    spec_tokens: int = 7
-    kv_ram_gb: int = 0  # tier KV cache into system RAM (0=off)
-    extra_args: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

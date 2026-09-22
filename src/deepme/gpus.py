@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import config, remote
+from . import remote
 
 
 def summary() -> str:
@@ -26,10 +26,10 @@ def reclaim() -> str:
     all 8 GPUs for the inference deployment. Also clears systemd failure state.
     """
     script = f"""\
-svc_pids=$(systemctl show -p MainPID --value {config.SYSTEMD_UNIT} 2>/dev/null)
+svc_pids=$(systemctl show -p MainPID --value deepme-llm 2>/dev/null)
 for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader | sort -u); do
   # keep anything in our service's cgroup
-  if grep -q {config.SYSTEMD_UNIT} /proc/$p/cgroup 2>/dev/null; then
+  if grep -q deepme-llm /proc/$p/cgroup 2>/dev/null; then
     echo "keeping $p (our service)"
     continue
   fi
@@ -38,9 +38,9 @@ for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader | sort -u);
 done
 sleep 5
 for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader | sort -u); do
-  grep -q {config.SYSTEMD_UNIT} /proc/$p/cgroup 2>/dev/null || kill -9 "$p" 2>/dev/null || true
+  grep -q deepme-llm /proc/$p/cgroup 2>/dev/null || kill -9 "$p" 2>/dev/null || true
 done
-sudo systemctl reset-failed {config.SYSTEMD_UNIT} 2>/dev/null || true
+for u in /etc/systemd/system/deepme-llm*.service; do [ -e "$u" ] && sudo systemctl reset-failed $(basename "$u" .service) 2>/dev/null || true; done
 sleep 2
 echo "--- after ---"
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader

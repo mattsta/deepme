@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import httpx
 
 from . import config
+from .profiles import RunSpec
 
 # A prompt that forces long, non-degenerate output without a huge input.
 _BENCH_PROMPT = (
@@ -32,13 +33,15 @@ class StreamStats:
     duration_s: float
 
 
-async def _one_stream(client: httpx.AsyncClient, max_tokens: int) -> StreamStats | None:
+async def _one_stream(
+    spec: RunSpec, client: httpx.AsyncClient, max_tokens: int
+) -> StreamStats | None:
     payload = {
-        "model": config.SERVED_MODEL_NAME,
+        "model": spec.served_name,
         "messages": [{"role": "user", "content": _BENCH_PROMPT}],
         "max_tokens": max_tokens,
-        "temperature": config.DEFAULT_TEMPERATURE,
-        "top_p": config.DEFAULT_TOP_P,
+        "temperature": spec.temperature,
+        "top_p": spec.top_p,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
@@ -48,7 +51,7 @@ async def _one_stream(client: httpx.AsyncClient, max_tokens: int) -> StreamStats
     try:
         async with client.stream(
             "POST",
-            f"{config.API_BASE}/v1/chat/completions",
+            f"{spec.api_base}/v1/chat/completions",
             json=payload,
             headers={"Authorization": f"Bearer {config.api_key()}"},
         ) as resp:
@@ -74,11 +77,11 @@ async def _one_stream(client: httpx.AsyncClient, max_tokens: int) -> StreamStats
     )
 
 
-async def _run_level(concurrency: int, max_tokens: int) -> dict:
+async def _run_level(spec: RunSpec, concurrency: int, max_tokens: int) -> dict:
     async with httpx.AsyncClient(timeout=1200) as client:
         wall_start = time.monotonic()
         results = await asyncio.gather(
-            *[_one_stream(client, max_tokens) for _ in range(concurrency)]
+            *[_one_stream(spec, client, max_tokens) for _ in range(concurrency)]
         )
         wall = time.monotonic() - wall_start
     good = [r for r in results if r is not None and r.tokens > 0]
@@ -103,11 +106,11 @@ async def _run_level(concurrency: int, max_tokens: int) -> dict:
     }
 
 
-def run(concurrencies: list[int], max_tokens: int = 1024) -> list[dict]:
+def run(spec: RunSpec, concurrencies: list[int], max_tokens: int = 1024) -> list[dict]:
     rows = []
     for c in concurrencies:
         print(f"benchmarking concurrency={c} max_tokens={max_tokens} ...")
-        row = asyncio.run(_run_level(c, max_tokens))
+        row = asyncio.run(_run_level(spec, c, max_tokens))
         print(f"  {row}")
         rows.append(row)
     return rows

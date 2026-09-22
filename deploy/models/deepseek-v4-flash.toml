@@ -1,0 +1,40 @@
+# Model profile: DeepSeek-V4-Flash-0731 (production)
+# One file = one deployable model. `uv run deepme model list` discovers these.
+
+# Weight size/shard-count are NOT declared here — they are fetched from the
+# Hugging Face API and cached (.deepme/hf/). Operators declare intent only.
+[model]
+repo = "deepseek-ai/DeepSeek-V4-Flash-0731"
+served_name = "deepseek-v4-flash"
+
+[serve]
+engine = "vllm"
+tp = 8
+gpus = [0, 1, 2, 3, 4, 5, 6, 7]
+port = 8000
+max_len = 1048576      # full 1M context (fits: 1.29M-token KV pool)
+gpu_mem = 0.94
+kv_ram_gb = 200        # tier evicted KV into system RAM
+spec_decode = false    # DSpark broken on SM120 in vllm 0.26 / sglang 0.5.17
+
+# Raw per-engine args appended to the generic launch skeleton.
+[serve.engine_args]
+vllm = [
+    "--reasoning-parser", "deepseek_v4",
+    "--tool-call-parser", "deepseek_v4",
+    "--enable-auto-tool-choice",
+    "--enable-prompt-tokens-details",
+    "--enable-force-include-usage",
+    "--enable-request-id-headers",
+    "--enable-per-request-metrics",
+    "--max-num-seqs", "8",
+]
+sglang = [
+    "--moe-runner-backend", "flashinfer_mxfp4",
+    "--swa-full-tokens-ratio", "0.1",
+    "--chunked-prefill-size", "4096",
+]
+
+[sampling]             # model-card recommended defaults, used by test/bench
+temperature = 1.0
+top_p = 0.95

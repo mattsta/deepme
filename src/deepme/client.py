@@ -1,13 +1,15 @@
-"""OpenAI-compatible API client helpers for testing the deployed model."""
+"""OpenAI-compatible API client helpers, driven by a RunSpec."""
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 
 import httpx
 
 from . import config
+from .profiles import RunSpec
 
 
 def _headers() -> dict[str, str]:
@@ -21,6 +23,7 @@ class ChatResult:
     total_s: float
     completion_tokens: int
     prompt_tokens: int
+    cached_tokens: int = 0
 
     @property
     def decode_tps(self) -> float:
@@ -31,50 +34,52 @@ class ChatResult:
 
 
 def chat(
+    spec: RunSpec,
     prompt: str,
     *,
     max_tokens: int = 512,
-    temperature: float = config.DEFAULT_TEMPERATURE,
-    top_p: float = config.DEFAULT_TOP_P,
     timeout: float = 600,
 ) -> ChatResult:
-    """Streaming chat completion with client-side TTFT / tok/s measurement."""
+    """Streaming chat completion with client-side TTFT / tok/s measurement.
+
+    Sampling defaults come from the model profile.
+    """
     payload = {
-        "model": config.SERVED_MODEL_NAME,
+        "model": spec.served_name,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
+        "temperature": spec.temperature,
+        "top_p": spec.top_p,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
     text_parts: list[str] = []
     ttft = None
-    completion_tokens = 0
-    prompt_tokens = 0
+    completion_tokens = prompt_tokens = cached_tokens = 0
     start = time.monotonic()
-    with httpx.Client(timeout=timeout) as client, client.stream(
-        "POST",
-        f"{config.API_BASE}/v1/chat/completions",
-        json=payload,
-        headers=_headers(),
-    ) as resp:
+    with (
+        httpx.Client(timeout=timeout) as client,
+        client.stream(
+            "POST",
+            f"{spec.api_base}/v1/chat/completions",
+            json=payload,
+            headers=_headers(),
+        ) as resp,
+    ):
         resp.raise_for_status()
-        import json as _json
-
         for line in resp.iter_lines():
             if not line.startswith("data:"):
                 continue
             data = line[5:].strip()
             if data == "[DONE]":
                 break
-            chunk = _json.loads(data)
+            chunk = json.loads(data)
             usage = chunk.get("usage")
             if usage:
-                completion_tokens = usage.get(
-                    "completion_tokens", completion_tokens
-                )
+                completion_tokens = usage.get("completion_tokens", completion_tokens)
                 prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                details = usage.get("prompt_tokens_details") or {}
+                cached_tokens = details.get("cached_tokens", cached_tokens)
             for choice in chunk.get("choices", []):
                 delta = (choice.get("delta") or {}).get("content")
                 if delta:
@@ -88,10 +93,56 @@ def chat(
         total_s=total,
         completion_tokens=completion_tokens,
         prompt_tokens=prompt_tokens,
+        cached_tokens=cached_tokens,
     )
 
 
-def models() -> list[str]:
-    r = httpx.get(f"{config.API_BASE}/v1/models", headers=_headers(), timeout=10)
+def tool_call_test(spec: RunSpec) -> dict:
+    """Send a canned tool-enabled request; return the parsed tool_calls and
+    reasoning fields so parser wiring can be verified end-to-end."""
+    payload = {
+        "model": spec.served_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": "What's the weather in Tokyo right now? Use the tool.",
+            }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get current weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+        "max_tokens": 1024,
+        "temperature": spec.temperature,
+        "top_p": spec.top_p,
+    }
+    r = httpx.post(
+        f"{spec.api_base}/v1/chat/completions",
+        json=payload,
+        headers=_headers(),
+        timeout=300,
+    )
+    r.raise_for_status()
+    msg = r.json()["choices"][0]["message"]
+    return {
+        "finish_reason": r.json()["choices"][0].get("finish_reason"),
+        "tool_calls": msg.get("tool_calls"),
+        "reasoning_present": bool(msg.get("reasoning_content") or msg.get("reasoning")),
+        "content": (msg.get("content") or "")[:200],
+    }
+
+
+def models(spec: RunSpec) -> list[str]:
+    r = httpx.get(f"{spec.api_base}/v1/models", headers=_headers(), timeout=10)
     r.raise_for_status()
     return [m["id"] for m in r.json().get("data", [])]
