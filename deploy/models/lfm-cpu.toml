@@ -1,0 +1,39 @@
+# Model profile: LiquidAI/LFM2.5-2.6B-GGUF
+# (gguf: 7 variants; auto-selected: LFM2.5-2.6B-Q6_K.gguf, per HF API)
+[model]
+repo = "LiquidAI/LFM2.5-2.6B-GGUF"
+served_name = "lfm-cpu"
+variant = ""   # empty = policy auto-selection; available:
+#   LFM2.5-2.6B-BF16.gguf  (5.0GiB)
+#   LFM2.5-2.6B-F16.gguf  (5.0GiB)
+#   LFM2.5-2.6B-Q4_0.gguf  (1.5GiB)
+#   LFM2.5-2.6B-Q4_K_M.gguf  (1.6GiB)
+#   LFM2.5-2.6B-Q5_K_M.gguf  (1.8GiB)
+#   LFM2.5-2.6B-Q6_K.gguf  (2.1GiB)
+#   LFM2.5-2.6B-Q8_0.gguf  (2.7GiB)
+
+# CPU placement: claims no GPUs, so it colocates alongside the GPU model.
+# Cores are pinned within one NUMA node by the allocator (resources.py).
+[resources]
+mode = "cpu"
+cpus = 32
+ram_gb = 24
+
+[serve]
+engine = "llamacpp"
+tp = 1
+gpus = []
+port = 8010
+max_len = 8192
+gpu_mem = 0.90
+kv_ram_gb = 0
+spec_decode = false
+
+[serve.engine_args]
+vllm = []
+sglang = []
+llamacpp = []
+
+[sampling]
+temperature = 1.0
+top_p = 1.0

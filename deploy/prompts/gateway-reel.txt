@@ -1,0 +1,12 @@
+# Four-clip reel used to prove the full serving chain end to end:
+#   gateway (model+task) -> balancer (3 replicas) -> replica
+# Four items against three replicas on purpose: the fourth is admitted to the
+# queue and returns a ticket, so one run exercises routing, load balancing,
+# queueing and the ticket handover together.
+#
+# Prompts are written to be worth keeping — H3 generates synchronized audio,
+# so each names a sound source as well as a subject.
+A blacksmith hammers a glowing horseshoe on an anvil, sparks arcing into a dim workshop, each strike ringing bright and metallic
+Rain drums on the taut canvas of a market awning at night, neon signs reflected in the puddles below, water spilling over the edge in a steady sheet
+A cellist draws a slow bow across the strings in an empty concert hall, dust turning in a single shaft of afternoon light
+Waves collapse onto black volcanic sand in slow motion, foam hissing as it retreats, seabirds calling somewhere beyond the frame

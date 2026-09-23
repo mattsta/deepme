@@ -30,9 +30,12 @@ def record(
     detail: dict[str, Any] | None = None,
 ) -> str:
     """Append one ledger entry; returns the run id."""
+    import secrets
+
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%dT%H%M%S")
-    run_id = f"{ts}-{action}" + (f"-{spec.profile}" if spec else "")
+    # Random suffix so two ops in the same second never collide/overwrite.
+    run_id = f"{ts}-{action}" + (f"-{spec.profile}" if spec else "") + f"-{secrets.token_hex(2)}"
     entry = {
         "id": run_id,
         "time": time.strftime("%Y-%m-%d %H:%M:%S %z"),
@@ -52,8 +55,13 @@ def record(
 def tail(n: int = 20) -> list[dict]:
     if not LEDGER.exists():
         return []
-    lines = LEDGER.read_text().strip().splitlines()[-n:]
-    return [json.loads(line) for line in lines]
+    out = []
+    for line in LEDGER.read_text().strip().splitlines()[-n:]:
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # tolerate a torn/corrupt line (crash mid-append)
+    return out
 
 
 def load(run_id: str) -> dict:

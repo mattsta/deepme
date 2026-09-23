@@ -1,0 +1,43 @@
+# Showcase reel for MiniMax-H3 (text -> video + synchronised stereo audio).
+#
+# Every clip demonstrates a DIFFERENT capability, so the set doubles as a demo
+# reel and as the concurrency proof: run them together and they land on
+# different replicas via the balancer. Regenerate any time with
+# `uv run deepme showcase run -m h3-video`.
+#
+# Keep prompts describable in one line — they become captions in the gallery.
+
+[[clip]]
+name = "brass-cats"
+caption = "Text to video with synchronised audio — the cats play, then leave"
+prompt = """At night, while their owner sleeps, three cats play tiny brass \
+instruments on the bed, then quietly pick up their horns and exit."""
+seconds = 5
+seed = 1101
+
+[[clip]]
+name = "harbour-dawn"
+caption = "Cinematic camera motion and natural ambience"
+prompt = """A slow cinematic push through a misty fishing harbour at dawn: \
+gulls wheeling overhead, halyards ticking against masts, water lapping the \
+hulls, warm sunrise breaking behind the boats."""
+seconds = 6
+seed = 4242
+
+[[clip]]
+name = "market-vertical"
+caption = "Vertical 9:16 for social, with crowd ambience"
+prompt = """A bustling night market street food stall, flames leaping from a \
+wok, steam and sparks, vendor calling out, crowd chatter and sizzling."""
+seconds = 5
+seed = 77
+[clip.params]
+"target.aspect_ratio" = "9:16"
+
+[[clip]]
+name = "storm-window"
+caption = "Weather, glass and layered sound design"
+prompt = """Rain hammering a window at night, lightning flickering across a \
+dim room, thunder rolling in late, curtains breathing in the draught."""
+seconds = 5
+seed = 909

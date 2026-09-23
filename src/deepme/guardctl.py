@@ -13,7 +13,8 @@ from .profiles import RunSpec
 
 UNIT = "deepme-guard"
 GUARD_DIR = f"{config.REMOTE_RUNTIME_DIR}/guard"
-GUARD_PORT = 8001
+# Guard listen port — override in .deepme/config.toml: [server] guard_port
+GUARD_PORT = int(config._file_config().get("server", {}).get("guard_port", 8001))
 
 LOCAL_PROJECT = config.REPO_ROOT / "deploy" / "guard"
 LOCAL_GATE = config.REPO_ROOT / "src" / "deepme" / "guard" / "gate.py"
@@ -66,9 +67,6 @@ WorkingDirectory={GUARD_DIR}
 ExecStart={GUARD_DIR}/.venv/bin/uvicorn server:app --host 0.0.0.0 --port {GUARD_PORT}
 Restart=on-failure
 RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
 """
     remote.write_remote_file(f"/etc/systemd/system/{UNIT}.service", unit, sudo=True)
     remote.run(
@@ -86,10 +84,23 @@ def status() -> str:
     return r.stdout.strip() or "unknown"
 
 
+def health() -> tuple[bool, str]:
+    """HTTP reachability of the guard itself (proxied /v1/models)."""
+    import httpx
+
+    try:
+        r = httpx.get(
+            f"{api_base()}/v1/models",
+            headers={"Authorization": f"Bearer {config.api_key()}"},
+            timeout=5,
+        )
+        return r.status_code == 200, f"HTTP {r.status_code}"
+    except Exception as exc:
+        return False, type(exc).__name__
+
+
 def logs(lines: int = 60) -> str:
-    r = remote.run(
-        f"sudo journalctl -u {UNIT} -n {lines} --no-pager -o cat", check=False
-    )
+    r = remote.run(f"sudo journalctl -u {UNIT} -n {lines} --no-pager -o cat", check=False)
     return r.stdout
 
 

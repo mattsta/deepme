@@ -52,11 +52,11 @@ def run(
     argv = ["ssh", *_SSH_OPTS, config.SSH_TARGET, command]
     try:
         if stream:
-            proc = subprocess.run(argv, timeout=timeout)
-            result = Result(proc.returncode, "", "")
+            streamed = subprocess.run(argv, timeout=timeout)
+            result = Result(streamed.returncode, "", "")
         else:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-            result = Result(proc.returncode, proc.stdout, proc.stderr)
+            captured = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            result = Result(captured.returncode, captured.stdout, captured.stderr)
     except subprocess.TimeoutExpired:
         result = Result(124, "", f"ssh timed out after {timeout}s")
     if check and not result.ok:
@@ -67,16 +67,15 @@ def run(
     return result
 
 
-def run_script(
-    script: str, *, check: bool = True, timeout: float | None = 1800
-) -> Result:
+def run_script(script: str, *, check: bool = True, timeout: float | None = 1800) -> Result:
     """Run a multi-line bash script on the server via stdin."""
     config.require_host()
     argv = ["ssh", *_SSH_OPTS, config.SSH_TARGET, "bash -s"]
-    proc = subprocess.run(
-        argv, input=script, capture_output=True, text=True, timeout=timeout
-    )
-    result = Result(proc.returncode, proc.stdout, proc.stderr)
+    try:
+        proc = subprocess.run(argv, input=script, capture_output=True, text=True, timeout=timeout)
+        result = Result(proc.returncode, proc.stdout, proc.stderr)
+    except subprocess.TimeoutExpired:
+        result = Result(124, "", f"remote script timed out after {timeout}s")
     if check and not result.ok:
         raise RuntimeError(
             f"remote script failed ({result.returncode}):\n"
@@ -86,12 +85,16 @@ def run_script(
 
 
 def write_remote_file(path: str, content: str, *, sudo: bool = False) -> None:
-    """Write a file on the server (content piped over stdin, no quoting issues)."""
+    """Write a file on the server (content piped over stdin, no quoting issues).
+
+    The path is shell-quoted; content is stdin so it never touches the shell.
+    """
+    import shlex
+
     config.require_host()
-    tee = f"sudo tee {path}" if sudo else f"tee {path}"
+    qpath = shlex.quote(path)
+    tee = f"sudo tee {qpath}" if sudo else f"tee {qpath}"
     argv = ["ssh", *_SSH_OPTS, config.SSH_TARGET, f"{tee} > /dev/null"]
-    proc = subprocess.run(
-        argv, input=content, capture_output=True, text=True, timeout=60
-    )
+    proc = subprocess.run(argv, input=content, capture_output=True, text=True, timeout=60)
     if proc.returncode != 0:
         raise RuntimeError(f"failed writing {path}: {proc.stderr[-1000:]}")

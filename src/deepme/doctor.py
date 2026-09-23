@@ -20,6 +20,10 @@ CRITICAL_MODULES = {
         "vllm.model_executor.models.deepseek_v2",
         "vllm.model_executor.models.deepseek_v4",
     ],
+    "llamacpp": [
+        "llama_cpp",
+        "llama_cpp.server",
+    ],
 }
 
 
@@ -60,6 +64,13 @@ def import_probe(engine: str, modules: list[str] | None = None) -> str:
     path = push_script("import_probe.py")
     python = config.venv_python(engine)
     cuda = config.venv_cuda_home(engine)
-    env = f"CUDA_HOME={cuda} PATH={cuda}/bin:/usr/bin:/bin"
+    # Probe with the SAME runtime environment the serving unit uses, or the
+    # diagnosis won't reflect how the engine actually runs.
+    from . import engines as engines_mod
+
+    extra = " ".join(
+        f"{k}={v.format(cuda=cuda)}" for k, v in engines_mod.get(engine).runtime_env.items()
+    )
+    env = f"CUDA_HOME={cuda} PATH={cuda}/bin:/usr/bin:/bin {extra}".strip()
     r = remote.run(f"{env} {python} {path} {' '.join(mods)}", check=False, timeout=300)
     return (r.stdout + r.stderr).strip()

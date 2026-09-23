@@ -1,0 +1,14 @@
+# Post-fix validation set, run through the gateway at concurrency 4 against
+# 3 replicas so one item is admitted to the queue.
+#
+# What this run proves that the first reel could not: the occupancy accounting
+# fix. Before it, the submit round-trip was recorded as a completed job, so
+# mean_job_s read ~441s against a true mean of ~870s and every customer ETA
+# was halved. Expect mean_job_s here to land near the real generation time.
+#
+# Prompts stay showcase-grade — H3 renders synchronized audio, so each names
+# a sound source as well as a subject.
+A potter's wheel spins in a sunlit studio, wet clay rising between two hands, the wheel humming under a faint rhythmic scrape
+Snow falls through the beam of a streetlamp on an empty road at night, muffled silence broken by the distant scrape of a shovel
+A train pulls into an old station, steam venting across the platform, brakes shrieking as porters call to one another
+Koi drift beneath the surface of a still garden pond, water breaking in slow rings, bamboo knocking softly somewhere nearby

@@ -23,16 +23,25 @@ against a deployment is ground truth, and results land in the runs ledger.
 
 from __future__ import annotations
 
+from . import config
+
 GPU_HBM_GBS = 1790  # RTX 5090 memory bandwidth, GB/s
 BW_SINGLE_GPU = GPU_HBM_GBS * 0.70  # typical achievable single-GPU efficiency
 # MoE with expert parallelism: experts are read in parallel across GPUs, so
 # multi-GPU decode is NOT allreduce-bound. CALIBRATED from production:
-# DeepSeek-V4-Flash measured 87 tok/s at ~17.7GB active bytes/token.
+# DeepSeek-V4-Flash measured 87 tok/s at ~17.7GB active bytes/token
+# (155GiB FP8 weights x ~0.11 active fraction) -> ~1540 GB/s effective.
 BW_MULTI_GPU_MOE = 1540
 # Dense tensor-parallel over PCIe pays the full allreduce tax every layer.
 # ESTIMATED (no production dense-TP measurement yet — bench one to calibrate).
 BW_MULTI_GPU_DENSE = 600
-PER_GPU_BUDGET_GIB = 28  # usable VRAM per GPU for weights (32 - overhead)
+
+
+def per_gpu_budget_gib() -> float:
+    """Usable VRAM per GPU for weights — single source is config (cluster
+    shape x usable fraction - overhead)."""
+    return config.per_gpu_weight_budget_gib()
+
 
 # config.json field aliases across model families
 _EXPERT_COUNT_KEYS = (
@@ -59,19 +68,20 @@ def active_fraction(cfg: dict, total_params: int) -> float:
     topk = _first(cfg, _TOPK_KEYS)
     if not experts or not topk or not total_params:
         return 1.0
-    shared = _first(cfg, _SHARED_KEYS)
     hidden = int(cfg.get("hidden_size") or 0)
-    moe_inter = int(
-        cfg.get("moe_intermediate_size") or cfg.get("intermediate_size") or 0
-    )
+    moe_inter = int(cfg.get("moe_intermediate_size") or cfg.get("intermediate_size") or 0)
     layers = int(cfg.get("num_hidden_layers") or 0)
     if not (hidden and moe_inter and layers):
         # No dims to compute the expert share; assume experts dominate.
-        return min(1.0, (topk + shared + 1) / experts + 0.05)
-    # gate+up+down projections per expert
+        return min(1.0, topk / experts + 0.05)
+    # ROUTED-expert params only (shared experts + attention are in the dense
+    # always-on remainder). Of `experts` routed experts, `topk` fire per token.
     expert_params_total = experts * 3 * hidden * moe_inter * layers
     expert_share = min(0.99, expert_params_total / total_params)
-    active_expert_share = expert_share * (topk + shared) / experts
+    active_expert_share = expert_share * (topk / experts)
+    # The (1 - expert_share) dense remainder (attention + shared experts) is
+    # always read; shared experts are NOT added to the routed numerator (that
+    # would double-count them).
     return (1.0 - expert_share) + active_expert_share
 
 
@@ -108,8 +118,7 @@ def is_generative(task: str, architectures: tuple[str, ...]) -> bool:
     if task in NON_GENERATIVE_TASKS:
         return False
     return not (
-        architectures
-        and all(a.endswith(_NON_GENERATIVE_ARCH_SUFFIXES) for a in architectures)
+        architectures and all(a.endswith(_NON_GENERATIVE_ARCH_SUFFIXES) for a in architectures)
     )
 
 
@@ -121,12 +130,9 @@ def estimate_decode_tps(
         return None
     import math
 
-    tp = max(1, math.ceil(weight_bytes / (PER_GPU_BUDGET_GIB * 1024**3)))
+    tp = max(1, math.ceil(weight_bytes / (per_gpu_budget_gib() * 1024**3)))
     frac = active_fraction(cfg or {}, total_params)
     bytes_per_token = weight_bytes * frac
     is_moe = frac < 1.0
-    if tp == 1:
-        bw = BW_SINGLE_GPU
-    else:
-        bw = BW_MULTI_GPU_MOE if is_moe else BW_MULTI_GPU_DENSE
+    bw = BW_SINGLE_GPU if tp == 1 else BW_MULTI_GPU_MOE if is_moe else BW_MULTI_GPU_DENSE
     return (bw * 1e9) / bytes_per_token, tp

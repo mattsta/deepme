@@ -1,0 +1,82 @@
+# Model profile: MiniMaxAI/MiniMax-H3 — reference-conditioned generation.
+#
+# Same weights repo as h3-video, DIFFERENT partition. H3 splits its tasks
+# across two checkpoints (task_profiles.MINIMAX_H3_TASK_PARTITIONS):
+#   fl2va partition -> "t2va" (text only) and "fl2va" (first/last keyframes)
+#   ref2va partition -> "ref2va" (image/video/audio references as guidance)
+# So reference conditioning is a second deployment, not a request flag. Both
+# partitions are already on disk — the download fetches the whole repo.
+#
+# The split is enforced by the ENGINE, not just this config — verified live
+# (2026-08-10): a text-only t2va request sent straight to this replica is
+# ACCEPTED at the HTTP layer (200 + job id) and then failed by the scheduler
+# ("task 't2va' is not served by partition 'ref2va'"). Two consequences:
+#   * this replica can never soak t2va overflow — its revenue is ref2va
+#     demand or nothing (see economics.toml, demand caveat);
+#   * routing must keep t2va away from it (the gateway does, from `tasks`
+#     below) because the engine fails such requests LATE, as a dead job
+#     rather than an immediate 400.
+#
+# Hardware recipe is identical to h3-video (vendor's 2xRTX 5090 config):
+# https://docs.sglang.io/cookbook/diffusion/MiniMax/MiniMax-H3
+[model]
+repo = "MiniMaxAI/MiniMax-H3"
+served_name = "h3-ref"
+subfolder = "Ref2VA"
+
+[serve]
+engine = "sglang"
+# Reference-conditioned generation only; t2va/fl2va live on the FL2VA
+# partition (h3-video).
+tasks = ["ref2va"]
+tp = 2
+# The other free pair, so this can run alongside h3-video if wanted — though
+# two offloaded H3 deployments together need ~250GB of host RAM.
+gpus = [4, 5]
+port = 8031
+max_len = 131072
+gpu_mem = 0.90
+kv_ram_gb = 0
+spec_decode = false
+
+[serve.env]
+
+[serve.engine_args]
+vllm = []
+sglang = [
+  "--tp-size", "2",
+  "--ulysses-degree", "1",
+  "--performance-mode", "memory",
+  "--layerwise-offload-components", "dit,text_encoder,vae",
+  "--dit-offload-prefetch-size", "1",
+  "--dit-layerwise-resident-layers", "20",
+  "--enable-torch-compile", "false",
+]
+llamacpp = []
+
+[resources]
+# Cap covers the LOAD PEAK; the allocator's charge is the resting size (see
+# h3-video.toml for the measurements). Ref2VA shares its text encoder and
+# audio VAE with FL2VA — byte-identical, so the content-addressed store maps
+# one copy — and adds only its own transformer.
+# Uncapped — see h3-video.toml. GPUs bind, not RAM.
+ram_gb = 0
+
+[limits]
+# See h3-video.toml: the sigma schedule needs at least 2 points.
+min_steps = 2
+
+[generate]
+# ref2va REQUIRES at least one reference condition, so there is no useful
+# default list here — `deepme generate -m h3-ref --ref <file>` supplies it.
+task = "ref2va"
+
+[generate.target]
+short_edge = 768
+# ref2va forces aspect_ratio="auto": geometry is taken from the reference.
+aspect_ratio = "auto"
+duration_seconds = 5
+
+[sampling]
+temperature = 1.0
+top_p = 1.0

@@ -31,6 +31,36 @@ def _file_config() -> dict:
     return {}
 
 
+def _toml_value(v) -> str:
+    if isinstance(v, str):
+        return f'"{v}"'
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
+    return str(v)
+
+
+def write_config(data: dict) -> None:
+    """Serialize a nested {section: {k: v}} dict to .deepme/config.toml,
+    preserving every section. The single writer for all config mutations."""
+    lines = []
+    for section, body in data.items():
+        lines.append(f"[{section}]")
+        for k, v in body.items():
+            lines.append(f"{k} = {_toml_value(v)}")
+        lines.append("")
+    STATE_DIR.mkdir(exist_ok=True)
+    CONFIG_FILE.write_text("\n".join(lines))
+
+
+def update_config(section: str, **kv) -> None:
+    """Merge keys into one section of config.toml, keeping all other sections."""
+    data = _file_config()
+    data.setdefault(section, {}).update(kv)
+    write_config(data)
+
+
 _server = _file_config().get("server", {})
 
 SSH_HOST = os.environ.get("DEEPME_HOST") or _server.get("host", "")
@@ -44,7 +74,7 @@ def require_host() -> None:
         raise SystemExit(
             "no server configured — run: uv run deepme config init "
             "--host <ip-or-hostname> [--user <ssh-user>] [--port <api-port>] "
-            "(or set DEEPME_HOST / DEEPME_USER / DEEPME_PORT)"
+            "(or set DEEPME_HOST / DEEPME_USER)"
         )
 
 
@@ -87,7 +117,10 @@ def venv_cuda_home(engine: str) -> str:
 
 # Engines we know how to install and launch. Each is a uv project on the
 # server so they never fight over torch/flashinfer versions.
-ENGINES = ("sglang", "vllm")
+# NOTE: the engine list is the registry in engines.py — use
+# engines.names(include_experimental=False) for the provisionable default and
+# engines.names() for all. config must not import engines (circular), so this
+# alias is intentionally not defined here.
 # vllm is the production engine: sglang 0.5.17's DSpark draft autotune hits an
 # unsupported sparse-MLA kernel shape on SM120 (as does vllm 0.26's DSpark) —
 # revisit spec decode when either engine ships the SM120 kernels.
@@ -96,6 +129,49 @@ DEFAULT_ENGINE = "vllm"
 
 def venv_python(engine: str) -> str:
     return f"{engine_venv(engine)}/bin/python"
+
+
+# ---------------------------------------------------------------------------
+# Cluster shape — single source of truth for VRAM budget math (fit checks,
+# catalog capacity, perf estimates all derive from these). Override in
+# .deepme/config.toml: [cluster] gpus = 8, vram_gb = 32
+# ---------------------------------------------------------------------------
+
+# Usable VRAM fraction and fixed per-GPU runtime overhead used by fit/capacity
+# math when a profile's own gpu_mem isn't the reference point.
+USABLE_VRAM_FRACTION = 0.90
+PER_GPU_OVERHEAD_GIB = 3.0
+
+
+def cluster_gpu_count() -> int:
+    return int(_file_config().get("cluster", {}).get("gpus", 8))
+
+
+def cluster_vram_gib() -> float:
+    return float(_file_config().get("cluster", {}).get("vram_gb", 32))
+
+
+def cluster_ram_gib() -> float:
+    """System RAM (for CPU-mode placements). Probed value wins when cached."""
+    cfg = _file_config().get("cluster", {})
+    if "ram_gb" in cfg:
+        return float(cfg["ram_gb"])
+    cache = STATE_DIR / "capacity.json"
+    if cache.exists():
+        import json
+
+        try:
+            return float(json.loads(cache.read_text()).get("ram_gib") or 503)
+        except Exception:
+            pass
+    return 503.0
+
+
+def per_gpu_weight_budget_gib(gpu_mem: float | None = None) -> float:
+    """GiB available for WEIGHTS on one GPU after runtime overhead. gpu_mem
+    (a profile's memory fraction) overrides the default usable fraction."""
+    frac = gpu_mem if gpu_mem is not None else USABLE_VRAM_FRACTION
+    return cluster_vram_gib() * frac - PER_GPU_OVERHEAD_GIB
 
 
 # ---------------------------------------------------------------------------

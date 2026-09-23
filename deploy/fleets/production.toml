@@ -1,0 +1,17 @@
+# Production fleet: 3 base + 1 premium.
+#
+# GPUs are the hard constraint (8 cards / 2 per replica = 4 replicas in any
+# arrangement), so this split IS the pricing decision. Each ref2va replica
+# costs one base-tier replica of throughput, and ref2va is charged at 2x —
+# change the numbers here when demand or pricing moves, not the code.
+#
+#   h3-video -> t2va (text) + fl2va (start/end/both keyframes)   1x rate
+#   h3-ref   -> ref2va (image/video/audio references)            2x rate
+
+[[member]]
+profile = "h3-video"
+replicas = 3
+
+[[member]]
+profile = "h3-ref"
+replicas = 1

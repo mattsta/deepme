@@ -1,0 +1,5 @@
+# Maximum throughput on the base surface: no premium tier.
+# Use when ref2va demand does not justify giving up a quarter of capacity.
+[[member]]
+profile = "h3-video"
+replicas = 4

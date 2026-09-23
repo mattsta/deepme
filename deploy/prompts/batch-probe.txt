@@ -1,0 +1,4 @@
+# Two prompts with IDENTICAL parameters so they are eligible to co-batch.
+# Only the text differs, which the batch signature permits.
+A lighthouse beam sweeping through heavy fog, waves booming against rocks below
+A hot air balloon rising over patchwork farmland at sunrise, burner roaring

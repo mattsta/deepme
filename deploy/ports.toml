@@ -1,0 +1,42 @@
+# Declared port registry — the ONLY place ports are assigned.
+#
+# Nothing derives a port from another port. Derivation produced two live
+# collisions before this file existed:
+#   * a diffusion server binds its API port AND the next one, so h3-video
+#     replica 0 held 8030-8031 while h3-ref was declared at 8031;
+#   * the torch.distributed rendezvous and internal scheduler defaulted to
+#     fixed ports, so replica 0 of EVERY profile wanted 30005 and 5644.
+#
+# `span` states how many consecutive ports an allocation consumes.
+# `deepme ports` fails on any overlap.
+
+[services]
+guard    = 8001   # output-guard proxy
+lfm-cpu  = 8010   # CPU-colocated model
+gateway  = 8080   # single entry point: model+task -> fleet
+
+[profiles.h3-video]
+span      = 2                              # API port binds N and N+1
+replicas  = [8100, 8110, 8120, 8130]
+balancer  = 9100
+master    = [30100, 30101, 30102, 30103]   # torch.distributed rendezvous
+scheduler = [5710, 5711, 5712, 5713]       # engine-internal scheduler
+
+[profiles.h3-ref]
+span      = 2
+replicas  = [8200, 8210, 8220, 8230]
+balancer  = 9200
+master    = [30200, 30201, 30202, 30203]
+scheduler = [5720, 5721, 5722, 5723]
+
+[profiles.deepseek-v4-flash]
+replicas  = [8300]
+balancer  = 9300
+master    = [30300]
+scheduler = [5730]
+
+[profiles.dsv4-gguf]
+replicas  = [8400]
+balancer  = 9400
+master    = [30400]
+scheduler = [5740]

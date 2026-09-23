@@ -7,7 +7,7 @@ registry) and passed in as GUARD_FEATURES — an adapter method only runs
 when its feature is enabled, so the guard loop degrades per-engine without
 a single engine-name conditional in server.py:
 
-  continuation missing  -> violations resolve via replacement immediately
+  continuation missing  -> violations truncate at the clean boundary
   bad_words missing     -> no preemptive bans (gate still guarantees output)
   tokenize missing      -> no logit-bias suppression on retries
 
@@ -26,17 +26,39 @@ class EngineAdapter:
 
     # -- capability-gated operations ------------------------------------
 
+    # Structured-output / grammar params must NOT be re-applied to a
+    # continuation: they restart the grammar mid-document (e.g. JSON mode
+    # forces a fresh {...}, producing invalid output). Stripped from every
+    # continuation request.
+    _CONT_STRIP = (
+        "response_format",
+        "guided_json",
+        "guided_regex",
+        "guided_grammar",
+        "guided_choice",
+        "guided_decoding",
+        "tool_choice",
+        "n",
+    )
+
+    def _strip_structured(self, d: dict) -> dict:
+        for k in self._CONT_STRIP:
+            d.pop(k, None)
+        return d
+
     def continuation_body(self, body: dict, accepted: str) -> dict | None:
         """Request that resumes the accepted partial output; None if the
-        backend can't continue (guard then applies replacements directly)."""
+        backend can't continue (guard then truncates at the clean boundary)."""
         if "continuation" not in self.features:
             return None
-        cont = dict(body)
-        cont["messages"] = list(body["messages"]) + [
-            {"role": "assistant", "content": accepted}
-        ]
+        cont = self._strip_structured(dict(body))
+        cont["messages"] = [*list(body["messages"]), {"role": "assistant", "content": accepted}]
         cont["continue_final_message"] = True
         cont["add_generation_prompt"] = False
+        # Shrink the remaining budget by what's already accepted (~4 chars/tok)
+        # so retries can't multiply the client's token budget.
+        if isinstance(body.get("max_tokens"), int):
+            cont["max_tokens"] = max(16, body["max_tokens"] - len(accepted) // 4)
         return cont
 
     def apply_bans(self, body: dict, patterns: list[str]) -> dict:
@@ -68,20 +90,23 @@ class EngineAdapter:
                 toks = r.json().get("tokens") or []
                 if toks:
                     ids.append(toks[0])
-            except Exception:  # noqa: BLE001 - bias is best-effort
+            except Exception:
                 continue
         return ids
 
     def completions_continuation(self, body: dict, accepted: str) -> dict:
         """Raw completions continuation is universal: same request, prompt
         extended by the accepted output. No special flags, no capability."""
-        cont = dict(body)
+        cont = self._strip_structured(dict(body))
         prompt = body.get("prompt", "")
         if isinstance(prompt, list):
             prompt = prompt[0] if prompt else ""
         cont["prompt"] = prompt + accepted
         if isinstance(body.get("max_tokens"), int):
-            cont["max_tokens"] = max(16, body["max_tokens"])
+            # Shrink the remaining budget by what's already accepted (~4
+            # chars/token) so retries can't multiply the client's budget.
+            used_est = len(accepted) // 4
+            cont["max_tokens"] = max(16, body["max_tokens"] - used_est)
         return cont
 
     async def stream_completions(self, body: dict, auth: str):

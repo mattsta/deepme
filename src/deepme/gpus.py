@@ -21,11 +21,26 @@ fi
     return remote.run_script(script, check=False).stdout
 
 
+def list_foreign() -> str:
+    """The processes reclaim WOULD kill — the mandatory look-before-leap."""
+    script = """\
+for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader | sort -u); do
+  if grep -q deepme-llm /proc/$p/cgroup 2>/dev/null; then
+    echo "ours:    $p $(ps -o args= -p $p 2>/dev/null | cut -c1-100)"
+  else
+    echo "FOREIGN: $p $(ps -o args= -p $p 2>/dev/null | cut -c1-100)"
+  fi
+done
+"""
+    out = remote.run_script(script, check=False, timeout=60).stdout.strip()
+    return out or "no GPU compute processes at all"
+
+
 def reclaim() -> str:
     """Kill every GPU compute process that is NOT our systemd service, freeing
     all 8 GPUs for the inference deployment. Also clears systemd failure state.
     """
-    script = f"""\
+    script = """\
 svc_pids=$(systemctl show -p MainPID --value deepme-llm 2>/dev/null)
 for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader | sort -u); do
   # keep anything in our service's cgroup
@@ -34,11 +49,11 @@ for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader | sort -u);
     continue
   fi
   echo "killing $p: $(ps -o args= -p $p 2>/dev/null | cut -c1-120)"
-  kill "$p" 2>/dev/null || true
+  sudo kill "$p" 2>/dev/null || echo "  FAILED to kill $p (permission?)"
 done
 sleep 5
 for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader | sort -u); do
-  grep -q deepme-llm /proc/$p/cgroup 2>/dev/null || kill -9 "$p" 2>/dev/null || true
+  grep -q deepme-llm /proc/$p/cgroup 2>/dev/null || sudo kill -9 "$p" 2>/dev/null || echo "  still present: $p"
 done
 for u in /etc/systemd/system/deepme-llm*.service; do [ -e "$u" ] && sudo systemctl reset-failed $(basename "$u" .service) 2>/dev/null || true; done
 sleep 2

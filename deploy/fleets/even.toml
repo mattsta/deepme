@@ -1,0 +1,8 @@
+# Even split, for when premium demand matches base demand.
+[[member]]
+profile = "h3-video"
+replicas = 2
+
+[[member]]
+profile = "h3-ref"
+replicas = 2

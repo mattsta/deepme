@@ -18,6 +18,7 @@ import httpx
 from . import config
 
 ARCH_CACHE = config.STATE_DIR / "engine-archs.json"
+FORMATS_CACHE = config.STATE_DIR / "engine-formats.json"
 CATALOG_CACHE_DIR = config.STATE_DIR / "hf" / "catalog"
 CATALOG_TTL_S = 3600  # HF trending moves slowly and the API rate-limits;
 # reuse list responses for an hour (--refresh bypasses)
@@ -72,50 +73,190 @@ class CatalogEntry:
     rejections: tuple[str, ...] = ()
 
 
-def cluster_capacity_gib() -> float:
-    """Deployable weight budget: gpus x vram x usable fraction - overhead."""
+def capacity_for_gpus(n: int) -> float:
+    """Deployable weight budget across `n` GPUs."""
     cluster = config._file_config().get("cluster", {})
-    n = int(cluster.get("gpus", 8))
     vram = float(cluster.get("vram_gb", 32))
     # 0.90 usable fraction, ~3GB/GPU runtime overhead (activations/graphs/KV floor)
-    return n * (vram * 0.90 - 3.0)
+    return max(n, 0) * (vram * 0.90 - 3.0)
+
+
+def cluster_capacity_gib() -> float:
+    """Budget on an EMPTY machine — what the hardware could ever run."""
+    cluster = config._file_config().get("cluster", {})
+    return capacity_for_gpus(int(cluster.get("gpus", 8)))
+
+
+def free_capacity_gib() -> float:
+    """Budget in the GPUs that are free RIGHT NOW, given running units.
+
+    The difference matters operationally: `cluster_capacity_gib` answers
+    "could this box ever run it", this answers "can I start it now".
+    """
+    from . import resources
+
+    cap = resources.probe_capacity()
+    avail = resources.availability(cap, resources.current_claims())
+    return capacity_for_gpus(len(avail.free_gpus))
 
 
 def engine_archs(*, refresh: bool = False) -> dict[str, list[str]]:
-    """Supported architectures per installed engine, cached locally."""
+    """Supported architectures per INSTALLED engine (probe evidence), cached.
+
+    A key present with a non-empty list means "probed, supports these". A key
+    ABSENT means "unknown" (engine not installed, or server was unreachable) —
+    callers must not treat unknown as unsupported. Failed/unreachable probes
+    are never cached (so a transient outage can't poison the catalog)."""
     if ARCH_CACHE.exists() and not refresh:
         return json.loads(ARCH_CACHE.read_text())
-    from . import doctor, remote
+    probed = _probe_engines("list_archs.py")
+    if probed is None:
+        return {}  # server unreachable: everything unknown, don't cache
+    config.STATE_DIR.mkdir(exist_ok=True)
+    ARCH_CACHE.write_text(json.dumps(probed))
+    return probed
 
+
+def _probe_engines(script: str) -> dict[str, list[str]] | None:
+    """Run a per-engine probe on the server. Returns None if the server is
+    unreachable (caller degrades); otherwise a dict with an entry ONLY for
+    engines whose venv exists and probed successfully (installed engines)."""
+    from . import doctor, remote
+    from . import engines as engines_mod
+
+    if not remote.run("echo ok", check=False, timeout=10).ok:
+        return None
+    path = doctor.push_script(script)
     result: dict[str, list[str]] = {}
-    path = doctor.push_script("list_archs.py")
-    for eng in config.ENGINES:
+    for eng in engines_mod.names():
+        installed = remote.run(
+            f"test -x {config.venv_python(eng)} && echo Y || echo N", check=False
+        )
+        if "Y" not in installed.stdout:
+            continue  # not installed -> unknown, omit
         r = remote.run(
-            f"{config.venv_python(eng)} {path} {eng}", check=False, timeout=300
+            f"{config.venv_python(eng)} {path} {eng} 2>/dev/null",
+            check=False,
+            timeout=300,
         )
         try:
-            result[eng] = json.loads(r.stdout.strip().splitlines()[-1])
-        except Exception:  # noqa: BLE001 - engine may be broken/missing
+            data = json.loads(r.stdout.strip().splitlines()[-1])
+            result[eng] = data if isinstance(data, list) else []
+        except Exception:
             result[eng] = []
-    config.STATE_DIR.mkdir(exist_ok=True)
-    ARCH_CACHE.write_text(json.dumps(result))
     return result
 
 
+def engine_formats(*, refresh: bool = False) -> dict[str, list[str]]:
+    """PROBED weight-format support per INSTALLED engine (never assumed).
+    Same absence semantics as engine_archs; unreachable probes not cached."""
+    if FORMATS_CACHE.exists() and not refresh:
+        return json.loads(FORMATS_CACHE.read_text())
+    probed = _probe_engines("list_formats.py")
+    if probed is None:
+        return {}
+    config.STATE_DIR.mkdir(exist_ok=True)
+    FORMATS_CACHE.write_text(json.dumps(probed))
+    return probed
+
+
+def effective_formats(engine: str, probed: dict[str, list[str]]) -> set[str]:
+    """Formats we can BOTH launch (declared) AND that the INSTALLED engine
+    proves it loads. Engine absent from `probed` = not installed / unknown ->
+    no effective formats (not a deployment candidate). When the whole probe
+    was unavailable (server down), `probed` is empty and callers degrade to
+    declared via `probed_or_declared`."""
+    from . import engines as engines_mod
+
+    declared = set(engines_mod.get(engine).formats)
+    if engine not in probed:
+        return set()
+    return declared & set(probed[engine])
+
+
+def probed_or_declared(probed: dict) -> dict:
+    """When the probe was unavailable (server down -> empty dict), degrade to
+    each engine's DECLARED formats so the catalog still works offline rather
+    than hiding everything. When probe data exists, use it as-is."""
+    from . import engines as engines_mod
+
+    if probed:
+        return probed
+    return {e.name: list(e.formats) for e in engines_mod.REGISTRY.values()}
+
+
+def candidate_engines(
+    formats: set,
+    archs: tuple,
+    probed_formats: dict,
+    archs_by_engine: dict,
+    kind: str = "llm",
+) -> list[str]:
+    """Proof-chain engine selection: model KIND x weight FORMAT x ARCH.
+
+    An engine qualifies when it serves this kind of model, can load one of
+    its formats (probed on the installed build), and — for LLMs on engines
+    with an introspectable registry — supports the architecture. Unknown
+    never rejects; only positive evidence of absence does. Production
+    engines are preferred over experimental ones.
+    """
+    from . import engines as engines_mod
+
+    pf = probed_or_declared(probed_formats)
+    out = []
+    for e in engines_mod.REGISTRY.values():
+        if kind not in e.kinds:
+            continue
+        if not (set(formats) & effective_formats(e.name, pf)):
+            continue
+        # Arch registries list LLM architectures; diffusion pipelines are
+        # registered separately, so the arch gate applies to LLMs only.
+        known = archs_by_engine.get(e.name)
+        if (
+            kind == engines_mod.KIND_LLM
+            and e.has_arch_registry
+            and known
+            and not any(a in known for a in archs)
+        ):
+            continue
+        out.append(e.name)
+    out.sort(key=lambda n: engines_mod.get(n).experimental)  # production first
+    return out
+
+
+SORTS = {
+    "trending": "trendingScore",
+    "downloads": "downloads",
+    "likes": "likes",
+    "modified": "lastModified",
+}
+
+
 def fetch_top(
-    limit: int = 100, tag: str | None = None, *, refresh: bool = False
+    limit: int = 100,
+    tag: str | None = None,
+    *,
+    refresh: bool = False,
+    sort: str = "trending",
+    search: str | None = None,
+    author: str | None = None,
 ) -> list[dict]:
-    """Top trending models (any modality) with size + config metadata.
+    """Model listing (any modality) with size + config metadata.
 
     No task prefilter: anything representable as weights is a candidate —
     the installed engines' registries are the only real serveability gate.
-    An optional pipeline tag narrows by modality when the operator asks.
+    `search`/`author`/`tag` narrow server-side when the operator asks (the
+    HF API does the filtering, so a search reaches models far outside the
+    top-N window).
 
-    Responses are TTL-cached locally (CATALOG_TTL_S) keyed by (limit, tag)
-    so repeated browsing doesn't hammer the rate-limited HF API.
+    Responses are TTL-cached locally (CATALOG_TTL_S) keyed by every query
+    parameter, so repeated browsing doesn't hammer the rate-limited API.
     """
+    if sort not in SORTS:
+        raise SystemExit(f"unknown sort {sort!r}; choose from {sorted(SORTS)}")
     CATALOG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = CATALOG_CACHE_DIR / f"top-{tag or 'all'}-{limit}.json"
+    key = f"{sort}-{tag or 'all'}-{author or 'any'}-{(search or 'none').replace('/', '_')}-{limit}"
+    cache_file = CATALOG_CACHE_DIR / f"q-{key}.json"
     if not refresh and cache_file.exists():
         age = time.time() - cache_file.stat().st_mtime
         if age < CATALOG_TTL_S:
@@ -124,7 +265,10 @@ def fetch_top(
         "https://huggingface.co/api/models",
         params=[
             *([("pipeline_tag", tag)] if tag else []),
-            ("sort", "trendingScore"),
+            *([("search", search)] if search else []),
+            *([("author", author)] if author else []),
+            ("sort", SORTS[sort]),
+            ("direction", "-1"),
             ("limit", str(limit)),
             ("expand[]", "safetensors"),
             ("expand[]", "config"),
@@ -134,12 +278,28 @@ def fetch_top(
             ("expand[]", "pipeline_tag"),
         ],
         follow_redirects=True,
-        timeout=60,
+        timeout=120,
     )
     r.raise_for_status()
     data = r.json()
     cache_file.write_text(json.dumps(data))
     return data
+
+
+def prefilter(
+    m: dict, *, name_contains: str | None = None, min_downloads: int = 0, min_likes: int = 0
+) -> bool:
+    """Cheap match on LIST-API data only — no network.
+
+    Applied BEFORE the per-repo deep fetch so scanning a 1000-model catalog
+    costs one request, not a thousand. `name_contains` matches the repo id
+    (org and model name), case-insensitively.
+    """
+    if name_contains and name_contains.lower() not in m.get("id", "").lower():
+        return False
+    if min_downloads and int(m.get("downloads") or 0) < min_downloads:
+        return False
+    return not (min_likes and int(m.get("likes") or 0) < min_likes)
 
 
 def build(
@@ -148,14 +308,36 @@ def build(
     tag: str | None = None,
     refresh: bool = False,
     refresh_archs: bool = False,
+    sort: str = "trending",
+    search: str | None = None,
+    author: str | None = None,
+    name_contains: str | None = None,
+    min_downloads: int = 0,
+    min_likes: int = 0,
+    max_entries: int = 0,
+    capacity: float | None = None,
 ) -> list[CatalogEntry]:
-    from . import engines as engines_mod
     from . import hfmeta
 
     archs_by_engine = engine_archs(refresh=refresh_archs)
-    capacity = cluster_capacity_gib()
+    probed_formats = engine_formats(refresh=refresh_archs)
+    # Default budget is the whole machine; callers pass the FREE budget to ask
+    # "what could I start right now" instead of "what could this box ever run".
+    if capacity is None:
+        capacity = cluster_capacity_gib()
     entries: list[CatalogEntry] = []
-    for rank, m in enumerate(fetch_top(limit, tag, refresh=refresh), start=1):
+    listing = fetch_top(limit, tag, refresh=refresh, sort=sort, search=search, author=author)
+    # Cheap filters first: only survivors pay for a deep repo fetch.
+    survivors = [
+        (rank, m)
+        for rank, m in enumerate(listing, start=1)
+        if prefilter(
+            m, name_contains=name_contains, min_downloads=min_downloads, min_likes=min_likes
+        )
+    ]
+    if max_entries:
+        survivors = survivors[:max_entries]
+    for rank, m in survivors:
         st = m.get("safetensors") or {}
         param_counts: dict[str, int] = st.get("parameters") or {}
         total_params = st.get("total") or sum(param_counts.values())
@@ -174,8 +356,9 @@ def build(
         # Deep repo facts (one fetch per repo ever, cached): file inventory,
         # config dims for perf estimation, params, formats.
         try:
-            deep = hfmeta.get(m["id"])
-        except Exception:  # noqa: BLE001 - fetch failure -> stated below
+            deep = hfmeta.get(m["id"], refresh=refresh)
+        except (Exception, SystemExit):
+            # (gated/missing/unreachable) must not abort the whole catalog
             deep = None
         if deep:
             model_archs = model_archs or deep.architectures
@@ -203,29 +386,41 @@ def build(
                         f"below {policy.current().min_gguf_bits:g}-bit "
                         "minimum or unclassifiable"
                     )
-        # Weight size, most-authoritative first: ACTUAL file bytes ->
-        # per-dtype param arithmetic -> smallest deployable gguf variant.
-        # (File bytes outrank dtype math: sub-byte packings like FP4 experts
-        # make param-count arithmetic overestimate, e.g. DeepSeek-V4.)
-        param_bytes = sum(
-            count * _dtype_bytes(dt) for dt, count in param_counts.items()
-        )
-        if "safetensors" in formats and deep_st_gib:
-            weight_gib = deep_st_gib
-        elif param_bytes:
-            weight_gib = param_bytes / 1024**3
+        param_bytes = sum(count * _dtype_bytes(dt) for dt, count in param_counts.items())
+        if not param_bytes and deep is not None:
+            param_bytes = deep.param_bytes
+        # Per-format sizes; a repo is deployable if the MIN representation
+        # fits (a huge BF16 with a small allowed gguf variant is deployable
+        # via the gguf path). weight_gib/label track the representation we'd
+        # actually deploy: smallest that fits, else smallest overall.
+        st_gib = 0.0
+        if "safetensors" in formats:
+            # Two independent estimates, each with its own overestimation mode:
+            #   param math  — overestimates for sub-byte packing (FP4 experts)
+            #   file bytes  — overestimates for repos holding several
+            #                 components/copies (diffusers pipelines, refs)
+            # One deployment can be no larger than either, so take the min.
+            candidates = [g for g in (deep_st_gib, param_bytes / 1024**3) if g > 0]
+            st_gib = min(candidates) if candidates else 0.0
+        sizes: dict[str, float] = {}
+        if st_gib:
+            sizes["safetensors"] = st_gib
+        if gguf_gib:
+            sizes["gguf"] = gguf_gib
+        fitting = {f: s for f, s in sizes.items() if s <= capacity}
+        if fitting:
+            weight_fmt, weight_gib = min(fitting.items(), key=lambda kv: kv[1])
+            size_fits = True
+        elif sizes:
+            weight_fmt, weight_gib = min(sizes.items(), key=lambda kv: kv[1])
+            size_fits = False
         else:
-            weight_gib = gguf_gib or 0.0
-        # Engine support: declared cross-product of engine formats x
-        # (arch registry when the engine has one).
+            weight_fmt, weight_gib, size_fits = None, 0.0, True
+        # Engine support: proof chain — probed format evidence from the
+        # installed binaries x arch registries (see candidate_engines).
+        kind = deep.kind if deep is not None else "llm"
         engines = tuple(
-            e.name
-            for e in engines_mod.REGISTRY.values()
-            if set(e.formats) & set(formats)
-            and (
-                not e.has_arch_registry
-                or any(a in archs_by_engine.get(e.name, []) for a in model_archs)
-            )
+            candidate_engines(set(formats), model_archs, probed_formats, archs_by_engine, kind=kind)
         )
         # Every exclusion is recorded with its specific, auditable reason —
         # nothing is silently dropped.
@@ -240,23 +435,29 @@ def build(
                 else "no-weights: no policy-allowed weight representation remains"
             )
         if m.get("gated"):
+            rejections.append("gated: requires HF auth/license acceptance before download")
+        if formats and not size_fits:
+            label = "smallest gguf variant" if weight_fmt == "gguf" else weight_fmt
             rejections.append(
-                "gated: requires HF auth/license acceptance before download"
-            )
-        if formats and weight_gib > capacity:
-            rejections.append(
-                f"too-big: {weight_gib:.0f}GiB ({'smallest gguf variant' if gguf_gib else 'safetensors'}) "
-                f"> {capacity:.0f}GiB cluster budget"
+                f"too-big: {weight_gib:.0f}GiB ({label}) > {capacity:.0f}GiB cluster budget"
             )
         if formats and not engines:
-            what = "/".join(model_archs) or "no architectures declared"
-            rejections.append(
-                f"unsupported: formats={formats} archs={what} — no registered "
-                "engine covers this format+arch combination"
-            )
+            if kind == "diffusion":
+                # A diffusion pipeline with no capable engine installed —
+                # name the kind so the fix (install/enable one) is obvious.
+                comp = ", ".join(deep.components[:5]) if deep else "components"
+                rejections.append(
+                    f"no-engine-for-kind: diffusion pipeline ({comp}) — no "
+                    "installed engine serves diffusion models"
+                )
+            else:
+                what = "/".join(model_archs) or "no architectures declared"
+                rejections.append(
+                    f"unsupported: formats={formats} archs={what} — no registered "
+                    "engine covers this format+arch combination"
+                )
         fits = not any(
-            r.startswith(("too-big", "gated", "no-weights", "quant-policy"))
-            for r in rejections
+            r.startswith(("too-big", "gated", "no-weights", "quant-policy")) for r in rejections
         )
         reason = "; ".join(rejections)
         if gguf_count:
@@ -268,15 +469,13 @@ def build(
 
         est_tps, tp_needed = 0.0, 0
         if perfmodel.is_generative(task, model_archs):
-            est = perfmodel.estimate_decode_tps(
-                config_dims, total_params, weight_gib * 1024**3
-            )
+            est = perfmodel.estimate_decode_tps(config_dims, total_params, weight_gib * 1024**3)
             if est:
                 est_tps, tp_needed = est
         elif weight_gib:
             import math
 
-            tp_needed = max(1, math.ceil(weight_gib / perfmodel.PER_GPU_BUDGET_GIB))
+            tp_needed = max(1, math.ceil(weight_gib / perfmodel.per_gpu_budget_gib()))
         entries.append(
             CatalogEntry(
                 repo=m["id"],

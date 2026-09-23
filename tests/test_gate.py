@@ -80,9 +80,7 @@ def test_word_split_across_many_tiny_chunks():
     released, violations = run_stream(policy(), list("so t h a t".replace(" ", "")))
     # "sothat" contains no isolated 'that' (it's inside a word) — allowed
     assert violations == []
-    released, violations = run_stream(
-        policy(), list("so ") + list("that") + list(" ok")
-    )
+    released, violations = run_stream(policy(), list("so ") + list("that") + list(" ok"))
     assert len(violations) == 1
     assert "that" not in released.lower()
 
@@ -145,7 +143,7 @@ def test_markup_fragmented_evasion_is_caught():
 
 
 def test_strip_chars_does_not_false_positive_inside_words():
-    released, violations = run_stream(policy(), ["use snake_case_that_works here"])
+    _released, violations = run_stream(policy(), ["use snake_case_that_works here"])
     # underscore is stripped in shadow: "snakecasethatworks" — 'that' is
     # inside a word there, so still allowed
     assert violations == []
@@ -180,9 +178,7 @@ def test_request_disables_guard():
 
 
 def test_request_inline_rules():
-    p = _sets_policy().resolve(
-        {"sets": [], "rules": [{"pattern": "foo", "kind": "word"}]}
-    )
+    p = _sets_policy().resolve({"sets": [], "rules": [{"pattern": "foo", "kind": "word"}]})
     assert p.scan("so that works") is None  # named sets deselected
     assert p.scan("a foo b") is not None  # inline rule active
 
@@ -197,6 +193,33 @@ def test_scope_default_and_override():
     assert p.scope == ("content",)
     p2 = p.resolve({"scope": ["content", "tool_arguments"]})
     assert "tool_arguments" in p2.scope
+
+
+def test_phrase_with_many_spaces_not_bypassed():
+    # BYPASS regression: phrase words separated by many spaces must still be
+    # caught — the old fixed hold window released the prefix before scan saw
+    # the full match.
+    gate = StreamGate(policy())
+    released = ""
+    for chunk in ["let us delve" + " " * 6 + "into the topic and more and more"]:
+        out, v = gate.feed(chunk)
+        released += out
+        assert v is None or "delve" not in released
+    out, v = gate.flush()
+    released += out
+    assert "delve" not in released.split("into")[0] or v is not None
+
+
+def test_markup_inflated_word_not_bypassed_within_budget():
+    # '*t*h*a*t*' — markup runs within the strip budget must still be caught.
+    gate = StreamGate(policy())
+    released = ""
+    for ch in "aardvark *t*h*a*t* more text here padding padding padding":
+        out, v = gate.feed(ch)
+        released += out
+        if v:
+            break
+    assert "that" not in released.lower().replace("aardvark", "")
 
 
 def test_join_seam_collapses_doubled_space():

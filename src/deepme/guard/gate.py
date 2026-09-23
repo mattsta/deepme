@@ -28,6 +28,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+# Whitespace between phrase words is bounded so a phrase's maximum raw match
+# span is finite and the streaming hold window can guarantee catching it.
+PHRASE_GAP_MAX = 8
+# Regex matches have unknown length; assume up to this raw span for hold sizing.
+REGEX_SPAN_MAX = 256
+
 
 @dataclass(frozen=True)
 class Rule:
@@ -43,11 +49,21 @@ class Rule:
             return re.compile(re.escape(self.pattern), flags)
         if self.kind == "phrase":
             words = self.pattern.split()
-            body = r"\s+".join(re.escape(w) for w in words)
+            body = rf"\s{{1,{PHRASE_GAP_MAX}}}".join(re.escape(w) for w in words)
             return re.compile(rf"(?<![\w]){body}(?![\w])", flags)
         if self.kind == "regex":
             return re.compile(self.pattern, flags)
         raise ValueError(f"unknown rule kind {self.kind!r}")
+
+    def base_span(self) -> int:
+        """Upper bound on the raw characters a match can span, BEFORE shadow
+        (strip-char) inflation. Drives the streaming hold window."""
+        if self.kind == "phrase":
+            words = self.pattern.split()
+            return sum(len(w) for w in words) + PHRASE_GAP_MAX * max(0, len(words) - 1)
+        if self.kind == "regex":
+            return REGEX_SPAN_MAX
+        return len(self.pattern)
 
 
 @dataclass(frozen=True)
@@ -123,9 +139,7 @@ class GuardPolicy:
         else:
             unknown = [n for n in names if n not in self.sets]
             if unknown:
-                raise ValueError(
-                    f"unknown guard sets: {unknown}; available: {sorted(self.sets)}"
-                )
+                raise ValueError(f"unknown guard sets: {unknown}; available: {sorted(self.sets)}")
             rules = [r for n in names for r in self.sets[n]]
         rules += [_parse_rule(r) for r in request_guard.get("rules", [])]
         return GuardPolicy(
@@ -145,6 +159,15 @@ class GuardPolicy:
     def max_pattern_len(self) -> int:
         return max((len(r.pattern) for r in self.rules), default=0)
 
+    @property
+    def hold_window(self) -> int:
+        """Raw characters to hold back so a forming match can never straddle
+        the release boundary. Sized from each rule's max RAW span: base span
+        (phrase gaps bounded, regex bounded) plus a strip-char inflation
+        budget (hold_slack) for markup-fragmented evasions like '*t*h*a*t'."""
+        base = max((r.base_span() for r in self.rules), default=0)
+        return base + max(self.hold_slack, 1)
+
     def scan(self, text: str) -> Violation | None:
         """Earliest violation in text — scanned both raw and with formatting
         characters stripped (shadow), offsets mapped back to raw text."""
@@ -158,11 +181,11 @@ class GuardPolicy:
                     offset_map.append(i)
             views.append(("".join(shadow_chars), offset_map))
         best: tuple[int, Rule, str] | None = None
-        for view_text, offset_map in views:
+        for view_text, view_map in views:
             for rule, rx in self.compiled():
                 m = rx.search(view_text)
                 if m:
-                    raw_start = offset_map[m.start()] if offset_map else m.start()
+                    raw_start = view_map[m.start()] if view_map else m.start()
                     if best is None or raw_start < best[0]:
                         best = (raw_start, rule, m.group(0))
         if best is None:
@@ -191,7 +214,11 @@ class StreamGate:
     def __init__(self, policy: GuardPolicy):
         self.policy = policy
         self.buf = ""
-        self.hold = policy.max_pattern_len + policy.hold_slack
+        self.hold = policy.hold_window
+        # Backoff cap: never withhold more than this (pathological all-space or
+        # all-markup streams still flush). 4x the hold window is generous.
+        self._backoff_cap = self.hold * 4
+        self._strip = set(policy.strip_chars)
 
     def feed(self, text: str) -> tuple[str, Violation | None]:
         """Add text; return (provably-clean releasable text, violation or None).
@@ -206,14 +233,19 @@ class StreamGate:
             self.buf = ""
             return clean, v
         # No violation: release everything except the hold window, and never
-        # split the trailing (possibly still-growing) word.
+        # cut inside a run that could still be forming a match — word chars,
+        # whitespace (phrase gaps), or strip chars (markup fragmentation) all
+        # extend a potential match, so back off over all three (bounded).
         release_end = len(self.buf) - self.hold
         if release_end <= 0:
             return "", None
-        while release_end > 0 and (
-            self.buf[release_end - 1].isalnum() or self.buf[release_end - 1] == "_"
-        ):
-            release_end -= 1
+        floor = max(0, len(self.buf) - self._backoff_cap)
+        while release_end > floor:
+            ch = self.buf[release_end - 1]
+            if ch.isalnum() or ch == "_" or ch.isspace() or ch in self._strip:
+                release_end -= 1
+            else:
+                break
         out, self.buf = self.buf[:release_end], self.buf[release_end:]
         return out, None
 

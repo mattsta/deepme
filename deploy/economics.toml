@@ -1,0 +1,136 @@
+# Economics of the platform: everything pricing derives from, in one file.
+#
+# Two kinds of value live here, deliberately separated:
+#   [server]/[market]/[pricing]  DECISIONS — change them to change policy.
+#   [measured.*]                 FACTS — written from real runs, with the run
+#                                named, so a price is always traceable to the
+#                                measurement it stands on. Re-measure with the
+#                                batches named below; do not tune by hand.
+#
+# `uv run deepme econ` shows everything derived from this file.
+# The gateway serves the same derivation at /v1/pricing (frozen at
+# `gateway start`, surge tier applied live from queue depth).
+
+[server]
+# Full burdened cost of the machine, per hour: CPU + RAM + 8x RTX 5090.
+# This is FIXED AND SUNK — the marginal cost of a generation on an otherwise
+# idle server is ~0, which is why spot pricing below floor-not-zero exists.
+cost_per_hour = 3.20
+# One diffusion job per replica (batching is gated off for this model family),
+# so replicas = concurrent jobs = 8 GPUs / 2 per replica.
+gpus = 8
+gpus_per_replica = 2
+
+[market]
+# What the market pays per second of GENERATED OUTPUT for this model class.
+rate_per_output_second = 0.13
+
+[pricing]
+# Spot floor = cost * this margin, per task. The floor is not about covering
+# cost (marginal cost is ~0); it is about not training customers who would
+# pay market rate to wait for spot instead. Keep it well above cost so spot
+# is a utilization backstop, not the default price.
+spot_floor_margin = 1.4
+# Surge ladder: queue depth PER REPLICA -> multiplier on the market rate.
+# Applied live by the gateway from its own queue signal; the thresholds are
+# policy, the queue depth is fact. Quotes are locked at the `submitted`
+# event (the billing line), never at quote time — queue depth moves while a
+# request waits, and a quote-time price lets customers arbitrage the surge.
+surge = [
+  { queued_per_replica = 0.0, multiplier = 1.0 },
+  { queued_per_replica = 0.5, multiplier = 1.4 },
+  { queued_per_replica = 1.0, multiplier = 1.8 },
+  { queued_per_replica = 3.0, multiplier = 2.3 },
+]
+
+# Price multiplier per task on the market rate. ref2va occupies a replica
+# 1.57x as long as t2va (measured), so anything under 1.57 makes running the
+# ref partition a LOSS against filling that replica with t2va — see the mix
+# table from `deepme econ`. 2.0 is the current product decision.
+[pricing.task_multipliers]
+t2va = 1.0
+fl2va = 1.0
+ref2va = 2.0
+
+[pricing.mixes]
+# Candidate fleet shapes, task -> replicas. `deepme econ` ranks these by
+# profit/hr at the configured prices — the fleet question is a pricing
+# question, so it is answered here rather than eyeballed.
+"4+0" = { t2va = 4 }
+"3+1" = { t2va = 3, ref2va = 1 }
+"2+2" = { t2va = 2, ref2va = 2 }
+
+# ---------------------------------------------------------------------------
+# MEASURED occupancy per task: how many replica-seconds one request consumes,
+# and how many seconds of output it produces. From the 2026-08-09 validation
+# runs (gateway-reel, validation-reel, capacity-proof; ref/fl via
+# `deepme generate`), 5s clips at the model-default 49 steps, concurrent
+# with a busy fleet — i.e. under production contention, not idle-server best
+# case. gpu_seconds is the mean of the observed wall times.
+
+[measured.tasks.t2va]
+gpu_seconds = 800.0    # observed 718-894s across 11 clips
+output_seconds = 5.0
+runs = "gateway-reel, validation-reel, capacity-proof"
+
+[measured.tasks.fl2va]
+gpu_seconds = 886.0    # observed 886.2s, one keyframe-conditioned clip
+output_seconds = 5.0
+runs = "generate --first-frame 2026-08-09"
+
+[measured.tasks.ref2va]
+gpu_seconds = 1254.0   # observed 1254.2s (24.1s/step vs ~16.3 for t2va)
+output_seconds = 5.0
+runs = "generate --ref 2026-08-09"
+
+# Duration scaling: wall seconds by requested clip length, same prompt, same
+# steps, measured concurrently. Filled by the `duration-curve` batch
+# (`deepme econ --record-duration`).
+#
+# MEASURED FINDING (2026-08-09): cost is SUPERLINEAR in duration — 10s runs
+# 1.12x linear, 15s runs 1.51x linear from the 4s point. Attention scales
+# with latent length, so per-output-second cost RISES with clip length:
+# $0.036/s at 4s but $0.054/s at 15s. Consequences, both applied by derive():
+#   * spot floors are scaled by the worst-case point, or a flat floor priced
+#     from short clips loses money on long ones;
+#   * flat per-second pricing quietly gives long clips the thinnest margin —
+#     the app layer gets the full curve via /v1/pricing to price by duration
+#     if it wants that margin back.
+# If anything the ratios are UNDERSTATED: the short clips finished first, so
+# the 15s run spent most of its time with less contention, not more.
+[measured.duration]
+batch = "duration-curve"
+# points = [ { seconds = 4, gpu_seconds = ... }, ... ]   <- written from the batch
+points = [
+  { seconds = 4.0, gpu_seconds = 644.2 },
+  { seconds = 10.0, gpu_seconds = 1796.8 },
+  { seconds = 15.0, gpu_seconds = 3644.7 },
+]
+
+# DIMENSIONS NOT YET MEASURED, in the order they would move prices:
+#   * aspect ratio: VRAM peak barely moves across ratios (envelope run), but
+#     wall time by ratio was never measured. Same shape as duration-curve —
+#     one batch with target.aspect_ratio varied — if per-ratio pricing is
+#     ever wanted.
+#   * concurrent contention: all task numbers above were measured with a busy
+#     fleet (PCIe/host-RAM streaming contention included). An idle-server
+#     single job runs somewhat faster; we price on the busy number since
+#     that is what a full fleet delivers. The gap itself is unmeasured.
+#   * demand: the mix ranking assumes every replica sells out. 2+2 beating
+#     3+1 at ref2va=2x holds ONLY if ref demand fills two replicas — a
+#     demand fact no measurement here can supply. Revisit with real order
+#     flow before changing the fleet on the ranking alone. This risk is NOT
+#     hedgeable at runtime: a ref replica cannot fall back to t2va work
+#     (verified live 2026-08-10 — the scheduler refuses cross-partition
+#     tasks: "task 't2va' is not served by partition 'ref2va'"). An idle ref
+#     replica earns nothing until the fleet is re-applied to a different mix.
+
+# Steps scaling (quality lever): measured 2026-08-08 on 4s clips — 50 steps
+# 659s, 20 steps 283s. Cost is ~linear in steps with a fixed overhead, so a
+# reduced-step "draft" tier can be priced from the same numbers.
+[measured.steps]
+default_steps = 49
+points = [
+  { steps = 20, gpu_seconds = 283.0, output_seconds = 4.0 },
+  { steps = 50, gpu_seconds = 659.0, output_seconds = 4.0 },
+]

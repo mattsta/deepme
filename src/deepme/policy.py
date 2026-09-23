@@ -63,14 +63,26 @@ class QuantPolicy:
     deny: tuple[str, ...] = ()  # fnmatch patterns, checked first
     allow: tuple[str, ...] = ()  # fnmatch patterns, checked before bit parse
 
+    @staticmethod
+    def _match(name_up: str, pat: str) -> bool:
+        """fnmatch against the full variant path, wrapping the pattern in
+        wildcards so a bare token like 'IQ*' matches anywhere in the path
+        (variant keys include a subdir prefix, so anchored fnmatch never hit)."""
+        p = pat.upper()
+        if not (p.startswith("*") or p.startswith("/")):
+            p = "*" + p
+        if not p.endswith("*"):
+            p = p + "*"
+        return fnmatch(name_up, p)
+
     def variant_allowed(self, variant_name: str) -> tuple[bool, str]:
         """(allowed, reason). Unknown bit-widths are denied, with the reason."""
         up = variant_name.upper()
         for pat in self.deny:
-            if fnmatch(up, pat.upper()):
+            if self._match(up, pat):
                 return False, f"denied by pattern {pat!r}"
         for pat in self.allow:
-            if fnmatch(up, pat.upper()):
+            if self._match(up, pat):
                 return True, f"allowed by pattern {pat!r}"
         bits = gguf_bits(variant_name)
         if bits is None:

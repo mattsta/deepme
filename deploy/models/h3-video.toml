@@ -1,0 +1,130 @@
+# Model profile: MiniMaxAI/MiniMax-H3 — synchronized video + stereo audio.
+# (62GiB deployable, per HF API)
+#
+# Configured from the vendor's published RTX 5090 recipe:
+# https://docs.sglang.io/cookbook/diffusion/MiniMax/MiniMax-H3
+# Their 4-GPU recipes target 80-141GiB cards; ours are 32GiB, so the DiT is
+# never GPU-resident — it streams block by block from host RAM (which is why
+# the recipe calls for 384GB+ of it). That trades latency for the ability to
+# run a 62GiB model at all, and leaves 6 GPUs free for other deployments.
+[model]
+repo = "MiniMaxAI/MiniMax-H3"
+served_name = "h3-video"
+# The repo root is a container: it ships two task partitions, each a complete
+# sglang-ready pipeline with its own model_index.json (incl. the _minimax_h3
+# release block sglang requires). FL2VA serves text-to-video ("t2va") and
+# first/last-frame conditioning; Ref2VA serves reference-conditioned requests.
+subfolder = "FL2VA"
+
+[serve]
+engine = "sglang"
+# What this partition accepts. The gateway routes on these rather than
+# hardcoding H3's topology (task_profiles.MINIMAX_H3_TASK_PARTITIONS).
+tasks = ["t2va", "fl2va"]
+tp = 2
+gpus = [6, 7]
+port = 8030
+max_len = 131072
+gpu_mem = 0.90
+kv_ram_gb = 0
+spec_decode = false
+
+[serve.env]
+# Required for replicas. The Run:ai streamer stages every safetensors file
+# into PRIVATE CPU memory per rank before handing tensors to the loader, so
+# each replica transiently needs ~230GiB on top of its steady state — two
+# replicas loading would OOM the box. Disabled, the loader mmaps each shard
+# and reads one tensor at a time, so the pages land in the SHARED page cache
+# that every replica of the same model reads from.
+SGLANG_USE_RUNAI_MODEL_STREAMER = "0"
+
+# Back the layerwise-offload weight buffers with /dev/shm so every replica of
+# this model maps ONE physical copy instead of allocating its own. Without it
+# each rank holds ~96GiB privately and the box tops out at 2 replicas; the
+# GPUs would allow 4. Requires `deepme patches install-hooks`; the hook is
+# inert (stock engine behaviour) if this is unset.
+DEEPME_SHARED_WEIGHTS = "1"
+
+[serve.engine_args]
+vllm = []
+# Vendor's 2xRTX 5090 recipe, verbatim in intent:
+#   TP2 with no Ulysses (sequence parallelism needs resident weights),
+#   memory-first tuning, DiT/encoder/VAE streamed layer by layer, and 20 DiT
+#   blocks held resident so every step is not a full round trip to host RAM.
+#   torch.compile stays off — the vendor notes it changes numerical output.
+sglang = [
+  "--tp-size", "2",
+  "--ulysses-degree", "1",
+  "--performance-mode", "memory",
+  "--layerwise-offload-components", "dit,text_encoder,vae",
+  "--dit-offload-prefetch-size", "1",
+  # MEASURED ENVELOPE (deploy/prompts/envelope.jsonl, ~5min to re-run):
+  #   6s 16:9  -> 24.5GiB      15s 16:9 -> 26.7GiB
+  #   10s 16:9 -> 26.8GiB      15s 21:9 -> 26.7GiB  (largest legal request)
+  # Peak plateaus past ~10s and barely moves with aspect ratio, so the whole
+  # legal request range fits at residency 20 with 5.9GiB to spare.
+  #
+  # Do NOT raise this without re-running the envelope. Each layer costs
+  # ~1.16GiB measured (5s clip: 21.9GiB at 20, 31.2GiB at 28), so 24 would
+  # leave ~1.3GiB on the worst case and 28 would not fit it at all. The VRAM
+  # cost is measured; a speed benefit never was.
+  "--dit-layerwise-resident-layers", "20",
+  "--enable-torch-compile", "false",
+  # Dynamic batching: requests whose sampling signature matches (same steps,
+  # flow shift, geometry, task — prompt and seed may differ) share one
+  # denoise pass. That matters disproportionately here because we are
+  # PCIe-bound, not compute-bound: the DiT streams from host RAM every step,
+  # so a batched pass streams those weights ONCE for both requests.
+  "--batching-max-size", "2",
+  # store_true, NOT the StoreBoolean used by neighbouring flags in the same
+  # parser — passing a value makes it a stray positional and the server exits
+  # with "unrecognized arguments: true" in 25 seconds.
+  "--enable-batching-metrics",
+]
+llamacpp = []
+
+[resources]
+# PER REPLICA, and it is the real limit on how many copies fit: the DiT lives
+# in host RAM under layerwise offload, so one replica sits around 180GiB
+# steady state. GPUs would allow four copies (2 each of 8); host RAM allows
+# two. Measured, not assumed — see `deepme plan`.
+# Uncapped, deliberately. GPUs are the binding constraint here (8 cards / 2
+# per replica = 4 replicas), and host RAM has never been the thing that runs
+# out — 4 replicas rest at ~163GiB of 503GiB. Capping meant guessing a load
+# peak, and every guess cost a restart to discover; an uncapped unit simply
+# uses what it needs. Set ram_gb again only if a model genuinely threatens
+# the machine.
+ram_gb = 0
+
+[limits]
+# num_inference_steps builds linspace(1.0, 0.0, N) as the sigma schedule, and
+# the engine requires at least 2 points (N=1 yields the single point [1.0]).
+# Denoise iterations are N-1, so steps=2 is one iteration. Below this the
+# server fails with "sigma schedules must be equal-length lists", which blames
+# the schedule rather than the step count.
+min_steps = 2
+
+[generate]
+# Merged into every generation request. H3 rejects any request without an
+# explicit task; this partition (FL2VA) serves "t2va" (text only) and
+# "fl2va" (first/last-frame conditioning, which also needs `conditions`).
+task = "t2va"
+conditions = []
+
+# H3 describes the output shape as an object rather than flat fields, and its
+# validator accepts a deliberately small projection (request_validation.py):
+#   short_edge       MUST be exactly 768 — no other value is accepted
+#   aspect_ratio     "auto" | 21:9 | 16:9 | 4:3 | 1:1 | 3:4 | 9:16
+#   duration_seconds 4.0 - 15.0, at a fixed 24fps
+# Everything outside {task, prompt, conditions, target, flow_shift,
+# audio_flow_shift, seed} is DISCARDED by the validator — including
+# num_inference_steps, size and fps. `--seconds` overrides duration_seconds;
+# reach the rest with e.g. `--param target.aspect_ratio=9:16`.
+[generate.target]
+short_edge = 768
+aspect_ratio = "16:9"
+duration_seconds = 5
+
+[sampling]
+temperature = 1.0
+top_p = 1.0

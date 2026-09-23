@@ -18,6 +18,36 @@ from . import config
 
 CACHE_DIR = config.STATE_DIR / "hf"
 
+# Bytes per parameter by safetensors dtype prefix (shared with catalog sizing).
+_DTYPE_BYTES_PER_PARAM = {
+    "F64": 8,
+    "I64": 8,
+    "U64": 8,
+    "F32": 4,
+    "I32": 4,
+    "U32": 4,
+    "F16": 2,
+    "BF16": 2,
+    "I16": 2,
+    "U16": 2,
+    "F8": 1,
+    "I8": 1,
+    "U8": 1,
+    "BOOL": 1,
+    "F4": 0.5,
+    "I4": 0.5,
+    "U4": 0.5,
+}
+
+
+def _dtype_key(dtype: str) -> str:
+    """Longest matching dtype prefix (BF16 before F16, F8 before F4...)."""
+    up = dtype.upper()
+    for prefix in sorted(_DTYPE_BYTES_PER_PARAM, key=len, reverse=True):
+        if up.startswith(prefix):
+            return prefix
+    return "BF16"
+
 
 @dataclass(frozen=True)
 class RepoMeta:
@@ -33,6 +63,10 @@ class RepoMeta:
     total_params: int = 0  # from safetensors or gguf metadata blocks
     pipeline_tag: str = ""
     config_dims: dict | None = None  # architecture dims for perf estimation
+    library: str = ""  # HF library_name (transformers, diffusers, ...)
+    is_pipeline: bool = False  # diffusers-style multi-component pipeline
+    components: tuple = ()  # component subfolders holding weights
+    param_bytes: int = 0  # ONE instance's weights, from per-dtype counts
 
     @property
     def weight_gib(self) -> float:
@@ -46,6 +80,38 @@ class RepoMeta:
         if self.gguf_variants:
             out.append("gguf")
         return tuple(out)
+
+    @property
+    def deployable_gib(self) -> float:
+        """Size of ONE deployment, the minimum of two upper bounds.
+
+        Per-dtype param math overestimates sub-byte packing (FP4 experts);
+        summing repo file bytes overestimates repos holding several
+        components or duplicate copies (diffusers pipelines). A deployment
+        can be no larger than either.
+        """
+        bounds = [b for b in (self.weight_bytes, self.param_bytes) if b > 0]
+        return (min(bounds) / 1024**3) if bounds else 0.0
+
+    @property
+    def kind(self) -> str:
+        """Model class: 'diffusion' for image/video pipelines, else 'llm'.
+
+        Decided from what the repo publishes: a diffusers pipeline index
+        (model_index.json), library_name, or a generative-media pipeline tag.
+        """
+        if self.is_pipeline or self.library == "diffusers":
+            return "diffusion"
+        media = (
+            "text-to-video",
+            "image-to-video",
+            "image-text-to-video",
+            "text-to-image",
+            "image-to-image",
+        )
+        if self.pipeline_tag in media:
+            return "diffusion"
+        return "llm"
 
     def smallest_gguf_gib(self) -> float | None:
         if not self.gguf_variants:
@@ -84,10 +150,11 @@ def get(repo: str, *, refresh: bool = False) -> RepoMeta:
     bytes) plus config.json architectures. One network round per repo, ever
     — cached indefinitely (releases are immutable); refresh re-fetches."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = CACHE_DIR / (repo.replace("/", "--") + ".v4.json")
+    cache_file = CACHE_DIR / (repo.replace("/", "--") + ".v5.json")
     if cache_file.exists() and not refresh:
         d = json.loads(cache_file.read_text())
         d["architectures"] = tuple(d.get("architectures") or ())
+        d["components"] = tuple(d.get("components") or ())
         return RepoMeta(**d)
     r = httpx.get(
         f"https://huggingface.co/api/models/{repo}",
@@ -95,6 +162,13 @@ def get(repo: str, *, refresh: bool = False) -> RepoMeta:
         follow_redirects=True,
         timeout=30,
     )
+    if r.status_code in (401, 403):
+        raise SystemExit(
+            f"{repo}: gated/private on Hugging Face — accept the license and "
+            "set HF_TOKEN on the server before downloading"
+        )
+    if r.status_code == 404:
+        raise SystemExit(f"{repo}: not found on Hugging Face — check the repo name")
     r.raise_for_status()
     info = r.json()
     siblings = info.get("siblings", [])
@@ -103,6 +177,23 @@ def get(repo: str, *, refresh: bool = False) -> RepoMeta:
     st_block = info.get("safetensors") or {}
     gguf_block = info.get("gguf") or {}
     total_params = int(st_block.get("total") or gguf_block.get("total") or 0)
+    # Bytes for ONE instance of the weights, from per-dtype parameter counts.
+    # (File-byte sums cover the whole repo, which may hold several components
+    # or duplicate copies — see `is_pipeline`.)
+    param_counts = st_block.get("parameters") or {}
+    param_bytes = int(
+        sum(n * _DTYPE_BYTES_PER_PARAM.get(_dtype_key(dt), 2.0) for dt, n in param_counts.items())
+    )
+    library = info.get("library_name") or ""
+    # diffusers-style pipelines declare model_index.json and split weights
+    # across component subfolders (transformer/, vae/, text_encoder/, ...).
+    names = [s.get("rfilename", "") for s in siblings]
+    is_pipeline = any(n in ("model_index.json", "modular_model_index.json") for n in names)
+    components = tuple(
+        sorted(
+            {n.split("/", 1)[0] for n in names if "/" in n and n.endswith((".safetensors", ".bin"))}
+        )
+    )
     archs: tuple[str, ...] = ()
     model_type = ""
     config_dims: dict | None = None
@@ -136,8 +227,13 @@ def get(repo: str, *, refresh: bool = False) -> RepoMeta:
         total_params=total_params,
         pipeline_tag=info.get("pipeline_tag") or "",
         config_dims=config_dims,
+        library=library,
+        is_pipeline=is_pipeline,
+        components=components,
+        param_bytes=param_bytes,
     )
     d = dict(meta.__dict__)
     d["architectures"] = list(meta.architectures)
+    d["components"] = list(meta.components)
     cache_file.write_text(json.dumps(d, indent=2))
     return meta

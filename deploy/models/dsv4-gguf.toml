@@ -1,0 +1,40 @@
+# Model profile: unsloth/DeepSeek-V4-Flash-0731-GGUF
+# (gguf: 15 variants; auto-selected: UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL.gguf, per HF API)
+[model]
+repo = "unsloth/DeepSeek-V4-Flash-0731-GGUF"
+served_name = "dsv4-gguf"
+variant = ""   # empty = policy auto-selection; available:
+#   UD-IQ1_M/DeepSeek-V4-Flash-0731-UD-IQ1_M.gguf  (80.9GiB)
+#   UD-IQ1_S/DeepSeek-V4-Flash-0731-UD-IQ1_S.gguf  (76.9GiB)
+#   UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M.gguf  (84.7GiB)
+#   UD-IQ2_XXS/DeepSeek-V4-Flash-0731-UD-IQ2_XXS.gguf  (84.6GiB)
+#   UD-IQ3_S/DeepSeek-V4-Flash-0731-UD-IQ3_S.gguf  (108.1GiB)
+#   UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS.gguf  (97.1GiB)
+#   UD-IQ4_NL/DeepSeek-V4-Flash-0731-UD-IQ4_NL.gguf  (127.3GiB)
+#   UD-IQ4_XS/DeepSeek-V4-Flash-0731-UD-IQ4_XS.gguf  (127.3GiB)
+#   UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL.gguf  (90.2GiB)
+#   UD-Q3_K_M/DeepSeek-V4-Flash-0731-UD-Q3_K_M.gguf  (119.3GiB)
+#   UD-Q3_K_XL/DeepSeek-V4-Flash-0731-UD-Q3_K_XL.gguf  (119.4GiB)
+#   UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL.gguf  (144.4GiB)
+#   UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL.gguf  (150.8GiB)
+#   dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf  (10.1GiB)
+#   dspark/dspark-DeepSeek-V4-Flash-0731-BF16.gguf  (10.5GiB)
+
+[serve]
+engine = "llamacpp"
+tp = 8
+gpus = [0, 1, 2, 3, 4, 5, 6, 7]
+port = 8020
+max_len = 131072
+gpu_mem = 0.90
+kv_ram_gb = 0
+spec_decode = false
+
+[serve.engine_args]
+vllm = []
+sglang = []
+llamacpp = []
+
+[sampling]
+temperature = 1.0
+top_p = 1.0
