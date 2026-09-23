@@ -32,6 +32,7 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 # Files live here: tmpfs, so "writing" a buffer only ever costs RAM.
@@ -83,8 +84,11 @@ def buffer_key(
 
 
 def paths(key: str) -> tuple[str, str, str]:
-    """(data file, ready marker, lock file) for a key."""
-    base = os.path.join(STORE_DIR, key)
+    """(data file, ready marker, lock file) for a key.
+
+    Strings, not Path objects: callers hand these to mmap/CUDA plumbing.
+    """
+    base = Path(STORE_DIR) / key
     return f"{base}.bin", f"{base}.ready", f"{base}.lock"
 
 
@@ -101,7 +105,7 @@ class Acquired:
 def _fresh(data_path: str, ready_path: str, nbytes: int) -> bool:
     """Is there a complete buffer of the right size already?"""
     try:
-        return os.path.exists(ready_path) and os.path.getsize(data_path) == nbytes
+        return Path(ready_path).exists() and Path(data_path).stat().st_size == nbytes
     except OSError:
         return False
 
@@ -125,7 +129,7 @@ def acquire(
         return Acquired(allocate_private(), prefilled=False, shared=False)
     data_path, ready_path, lock_path = paths(key)
     try:
-        os.makedirs(STORE_DIR, exist_ok=True)
+        Path(STORE_DIR).mkdir(parents=True, exist_ok=True)
         guard = (lock or _flock)(lock_path)
         with guard:
             already = _fresh(data_path, ready_path, nbytes)
@@ -139,11 +143,8 @@ def acquire(
 def publish(key: str) -> None:
     """Mark a buffer complete so other processes may map it."""
     _, ready_path, _ = paths(key)
-    try:
-        with open(ready_path, "w") as f:
-            f.write("ok")
-    except OSError:
-        pass
+    with contextlib.suppress(OSError):
+        Path(ready_path).write_text("ok")
 
 
 def _flock(path: str):
@@ -152,7 +153,7 @@ def _flock(path: str):
 
     class _Lock:
         def __enter__(self):
-            self.fh = open(path, "w")
+            self.fh = Path(path).open("w")
             fcntl.flock(self.fh, fcntl.LOCK_EX)
             return self
 
@@ -174,13 +175,10 @@ def orphans() -> list[str]:
     """
     out: list[str] = []
     try:
-        names = os.listdir(STORE_DIR)
+        entries = list(Path(STORE_DIR).iterdir())
     except OSError:
         return out
-    for name in names:
-        path = os.path.join(STORE_DIR, name)
-        if not _in_use(path):
-            out.append(path)
+    out.extend(str(p) for p in entries if not _in_use(str(p)))
     return out
 
 
@@ -189,9 +187,9 @@ def usage() -> dict:
     total = 0
     files = 0
     try:
-        for name in os.listdir(STORE_DIR):
-            if name.endswith(".bin"):
-                total += os.path.getsize(os.path.join(STORE_DIR, name))
+        for p in Path(STORE_DIR).iterdir():
+            if p.name.endswith(".bin"):
+                total += p.stat().st_size
                 files += 1
     except OSError:
         pass
@@ -199,7 +197,7 @@ def usage() -> dict:
     stale_bytes = 0
     for path in stale:
         with contextlib.suppress(OSError):
-            stale_bytes += os.path.getsize(path)
+            stale_bytes += Path(path).stat().st_size
     return {
         "dir": STORE_DIR,
         "buffers": files,
@@ -214,15 +212,14 @@ def clear(*, only_unused: bool = True) -> int:
     a model that will not be served again leaks RAM until this runs."""
     removed = 0
     try:
-        names = os.listdir(STORE_DIR)
+        entries = list(Path(STORE_DIR).iterdir())
     except OSError:
         return 0
-    for name in names:
-        path = os.path.join(STORE_DIR, name)
-        if only_unused and _in_use(path):
+    for p in entries:
+        if only_unused and _in_use(str(p)):
             continue
         try:
-            os.unlink(path)
+            p.unlink()
             removed += 1
         except OSError:
             pass
@@ -250,13 +247,12 @@ def main(argv: list[str] | None = None) -> int:
 def _in_use(path: str) -> bool:
     """Is any live process mapping this file?"""
     try:
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdigit():
                 continue
             try:
-                with open(f"/proc/{pid}/maps") as f:
-                    if path in f.read():
-                        return True
+                if path in (proc / "maps").read_text():
+                    return True
             except OSError:
                 continue
     except OSError:

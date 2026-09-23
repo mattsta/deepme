@@ -1313,7 +1313,8 @@ def fleet_switch(
     matches, drains the ones that leave (no new work, running jobs finish),
     and attaches the ones that arrive to their balancer AT RUNTIME — no
     balancer restart, so waiting tickets and job tracking survive. The
-    gateway is re-pointed only when the route set actually changes.
+    gateway is re-pointed on any shape change (its frozen catalog goes
+    stale on any resize); only a true no-op switch skips it.
 
     Ctrl-C is safe and re-running is always safe: every abort lands in the
     ledger with what completed, and the reconcile pass converges from any
@@ -1726,17 +1727,23 @@ def batch_list() -> None:
     for col in ("batch", "profile", "done", "failed", "pending", "running"):
         table.add_column(col)
     for path in rows:
+        b = None
         with contextlib.suppress(Exception):
             b = batch_mod.Batch.load(path.parent.name)
-            c = b.counts()
-            table.add_row(
-                b.name,
-                b.profile,
-                str(c["done"]),
-                str(c["failed"]),
-                str(c["pending"]),
-                str(c["running"]),
-            )
+        if b is None:
+            # A row that cannot load is still a fact worth showing — a
+            # silently skipped batch reads as "does not exist".
+            table.add_row(path.parent.name, "[red]unreadable state[/red]", "-", "-", "-", "-")
+            continue
+        c = b.counts()
+        table.add_row(
+            b.name,
+            b.profile,
+            str(c["done"]),
+            str(c["failed"]),
+            str(c["pending"]),
+            str(c["running"]),
+        )
     console.print(table)
 
 
@@ -3020,7 +3027,7 @@ def bench(
     )
     console.print(f"[dim]recorded as {run_id}[/dim]")
     if out:
-        with open(out, "w") as f:
+        with Path(out).open("w") as f:
             json.dump(rows, f, indent=2)
         console.print(f"wrote {out}")
     if not all_ok:

@@ -1,7 +1,12 @@
 # deepme
 
-Config-driven infrastructure CLI for serving large models on a dedicated
-multi-GPU server (reference: 8x RTX 5090 32GB, PCIe-only, 500GB RAM).
+Config-driven serving platform for large models on a dedicated multi-GPU
+server (reference: 8x RTX 5090 32GB, PCIe-only, 500GB RAM). Today it runs a
+production **video-generation platform** — replica fleets behind per-model
+load balancers and a routing gateway, with an admission queue, derived
+pricing/economics, artifact retention, and full operator observability
+(`top`, `capacity`, `events`, Prometheus `/metrics`) — alongside
+OpenAI-compatible text-LLM serving. One CLI drives all of it.
 
 **A model = one profile file** (`deploy/models/<name>.toml`) declaring the HF
 repo and serving intent (engine, GPUs, port, context, memory). Everything
@@ -16,9 +21,13 @@ Services expose OpenAI-compatible APIs behind a bearer key. No server
 identities live in the repo.
 
 **Docs**: [docs/RUNBOOK.md](docs/RUNBOOK.md) (operator procedures: bring-up,
-deploy, switch, incidents, guard policy, engine upgrades) ·
-[docs/USER-GUIDE.md](docs/USER-GUIDE.md) (API usage: chat, streaming, tools,
-guard controls, observability).
+deploy, fleet resizes, incidents, economics, engine upgrades) ·
+[docs/INTERNAL-API.md](docs/INTERNAL-API.md) (the service-layer contract:
+submit/follow/queue/pricing/observability) ·
+[docs/INVARIANTS.md](docs/INVARIANTS.md) (every self-management guarantee,
+with where it is enforced and tested) ·
+[docs/USER-GUIDE.md](docs/USER-GUIDE.md) (client API usage: chat,
+streaming, tools, guard controls, and video generation).
 
 ## Cold start → serving (fresh system runbook)
 
@@ -116,13 +125,13 @@ JSON.
 
 ### Video generation (MiniMax-H3, 2026-08-08)
 
-| what                              | measured                                           |
-| --------------------------------- | -------------------------------------------------- |
-| output                            | 1344x768 H.264 @ 24fps + AAC stereo 32kHz, one MP4 |
-| 4-second clip, 50 steps (default) | 659s wall, 577s of it denoise @ 11.7s/step         |
-| 4-second clip, 20 steps           | 283s wall — cost is linear in `--steps`            |
-| peak GPU                          | 21.9GiB per card, 2 of 8 GPUs                      |
-| host RAM                          | ~314GB peak (the DiT lives there)                  |
+| what                                                           | measured                                           |
+| -------------------------------------------------------------- | -------------------------------------------------- |
+| output                                                         | 1344x768 H.264 @ 24fps + AAC stereo 32kHz, one MP4 |
+| 4s clip, default schedule (50 sigma points = 49 denoise iters) | 659s wall, 577s of it denoise @ 11.7s/step         |
+| 4-second clip, 20 steps                                        | 283s wall — cost is linear in `--steps`            |
+| peak GPU                                                       | 21.9GiB per card, 2 of 8 GPUs                      |
+| host RAM                                                       | ~314GB peak (the DiT lives there)                  |
 
 `--steps` is the only speed lever available here. `quality="high"` (Cache-DiT
 step skipping, ~1.4x) **fails closed** on this hardware: the engine accepts it
@@ -281,7 +290,8 @@ applies them to every generated token including tool arguments; only the
 gate/regeneration layers are channel-scoped. Agents that must emit forbidden
 strings verbatim (e.g. editing an existing identifier) should send
 `{"guard": {"enabled": false}}` or a narrowed `sets` selection.
-| /v1/completions & other endpoints | passed through | transparent proxy (guard covers chat completions) |
+| /v1/completions | guarded | prompt-concat continuation, same three layers, violations audited |
+| other endpoints | passed through | transparent proxy |
 
 Endpoint/mode matrix (live-validated by `deepme guard test`): chat
 non-stream ✓, chat stream ✓ (true incremental SSE — 100+ deltas, not
@@ -297,7 +307,7 @@ code points, multi-word phrases, or full regexes. Three enforcement layers:
 1. **Sampler-level `bad_words`** injected into every request (multi-token
    sequence bans incl. case/space variants) — the model picks alternatives
    naturally, so most rules never even trigger downstream layers.
-2. **Streaming gate** (`src/deepme/guard/gate.py`, pure logic, 21 unit tests):
+2. **Streaming gate** (`src/deepme/guard/gate.py`, pure logic, 28 unit tests):
    releases only provably-clean text (hold-back window = longest pattern +
    slack + current word); scans a formatting-stripped shadow too, so
    markup-fragmented evasions like `*tha*t` are caught; on violation the
@@ -355,10 +365,12 @@ service layer -> gateway :8080 ─┬─ balancer :9100 -> h3-video x3  (t2va, f
                                 └─ balancer :9200 -> h3-ref  x1   (ref2va)
 ```
 
-Ports are **declared, never derived** (`deploy/ports.toml`, checked by
-`deepme ports`). Derivation produced two live collisions: a diffusion server
-binds its API port AND the next one, and the torch.distributed rendezvous
-defaulted to one fixed port for every profile.
+Ports for scaled replicas, balancers and services are **declared, never
+derived** (`deploy/ports.toml`, checked by `deepme ports`; a plain
+single-replica `serve start` still uses the profile's own `[serve] port`).
+Derivation produced two live collisions: a diffusion server binds its API
+port AND the next one, and the torch.distributed rendezvous defaulted to one
+fixed port for every profile.
 
 ## Replica fleets & load balancing
 
@@ -373,7 +385,8 @@ uv run deepme balancer status                 # inflight / done / mean job
 uv run deepme gateway start --setup           # one address for everything (:8080)
 ```
 
-Measured on 8x32GiB: **four replicas in 172GiB of host RAM** (two needed
+Measured on 8x32GiB: **four replicas at ~163GiB of host RAM at rest, 172GiB
+during concurrent generation** (two needed
 402GiB before the shared weight store), four concurrent clips in **18m28s**
 against ~62m serial — 3.4x, with the shortfall from clip-length variance
 rather than contention. Bring-up is ~5min: the first replica is staggered
@@ -393,9 +406,9 @@ actually up — gateway, then balancer, then the replica itself; `--direct` pins
 to a single replica.
 
 Ports are never derived, only declared: `deploy/ports.toml` assigns every
-replica, balancer and service, because a diffusion server binds its API port
-AND the next one, and derived assignment handed replica 1 a port replica 0
-already owned. `uv run deepme ports` fails on any overlap.
+scaled replica, balancer and service, because a diffusion server binds its
+API port AND the next one, and derived assignment handed replica 1 a port
+replica 0 already owned. `uv run deepme ports` fails on any overlap.
 
 ### Progress for callers
 
@@ -626,7 +639,7 @@ installed via `deepme setup -e llamacpp`).
 
 | command                                                       | what it does                                                                                              |
 | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `model list\|show\|use\|add\|refresh`                         | manage profiles (facts from HF API)                                                                       |
+| `model list\|show\|use\|add\|refresh\|variants`               | manage profiles (facts from HF API); `variants` picks a GGUF quant                                        |
 | `browse [--all] [--limit N]`                                  | interactive picker: HF trending x engine support x cluster fit                                            |
 | `runs` / `runs show <id>`                                     | deployment/bench ledger (history, full specs, outcomes)                                                   |
 | `check [--fix] [--types]`                                     | quality gate: ruff + pytest in ~2s; `--types` adds mypy (slow on 3.14t)                                   |
@@ -647,7 +660,7 @@ installed via `deepme setup -e llamacpp`).
 | `bench [-m P] -c N... [--out f.json]`                         | TTFT + throughput sweep                                                                                   |
 | `serve scale -m P -n N`                                       | run N replicas across free GPUs (first staggered, rest parallel)                                          |
 | `balancer start\|stop\|status [-m P]`                         | one API in front of N replicas; per-replica load                                                          |
-| `generate [-m P] "prompt" [--direct]`                         | one video via the balancer; live step/ETA progress                                                        |
+| `generate [-m P] "prompt" [--direct]`                         | one video via the best front end (gateway → balancer → replica); live step/ETA progress                   |
 | `batch run <file> [-m P]` / `batch status <name>`             | unattended backlog, resumable, one in flight per replica                                                  |
 | `story run <file> [-m P]` / `story join <name>`               | chained clips, each seeded by the previous last frame                                                     |
 | `showcase list\|run [-m P]`                                   | demo reel: concurrent proof that leaves assets behind                                                     |

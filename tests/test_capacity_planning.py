@@ -14,7 +14,7 @@ from deepme import resources as res
 # Two sockets, four GPUs each — the shape of the real box.
 CAP = res.Capacity(
     gpus=tuple(range(8)),
-    numa={0: tuple(range(0, 64)), 1: tuple(range(64, 128))},
+    numa={0: tuple(range(64)), 1: tuple(range(64, 128))},
     ram_gib=503.0,
 )
 

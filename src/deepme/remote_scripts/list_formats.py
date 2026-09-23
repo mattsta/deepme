@@ -36,13 +36,13 @@ def sglang_formats() -> list[str]:
 
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
-    for action in parser._actions:
-        if (
-            "--load-format" in (action.option_strings or [])
-            and action.choices
-            and "gguf" in action.choices
-        ):
-            fmts.append("gguf")
+    if any(
+        "--load-format" in (action.option_strings or [])
+        and action.choices
+        and "gguf" in action.choices
+        for action in parser._actions
+    ):
+        fmts.append("gguf")
     return fmts
 
 

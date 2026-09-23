@@ -25,7 +25,7 @@ def no_service_units(monkeypatch):
 
 @pytest.fixture
 def nothing_running(monkeypatch):
-    monkeypatch.setattr(res, "current_claims", lambda: [])
+    monkeypatch.setattr(res, "current_claims", list)
 
 
 @pytest.fixture

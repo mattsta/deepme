@@ -22,6 +22,7 @@ import contextlib
 import json
 import os
 import tomllib
+from pathlib import Path
 from typing import Any, TypedDict
 
 import httpx
@@ -88,7 +89,7 @@ POLICY_PATH = os.environ["GUARD_POLICY"]
 ENGINE = os.environ.get("GUARD_ENGINE", "vllm")
 FEATURES = set(filter(None, os.environ.get("GUARD_FEATURES", "").split(",")))
 
-with open(POLICY_PATH, "rb") as f:
+with Path(POLICY_PATH).open("rb") as f:
     POLICY = GuardPolicy.from_toml_dict(tomllib.load(f))
 
 app = FastAPI()
@@ -382,8 +383,7 @@ def _assemble_tool_calls(deltas: list) -> list | None:
             c["function"]["arguments"] += fn["arguments"]
     if not calls:
         return None
-    out = [calls[i] for i in sorted(calls)]
-    return out
+    return [calls[i] for i in sorted(calls)]
 
 
 def _resolve_policy(body: dict):

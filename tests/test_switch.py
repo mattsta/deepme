@@ -96,7 +96,7 @@ def production(monkeypatch, tmp_path):
         fleet_mod, "load", lambda name: SimpleNamespace(name=name, members=(), total_replicas=2)
     )
     monkeypatch.setattr(fleet_mod, "plan", lambda f, releasing_extra=None: [V0, V1])
-    return None
+    return
 
 
 def _run(ops, name="mix", force=False):

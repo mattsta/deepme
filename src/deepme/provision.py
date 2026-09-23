@@ -119,6 +119,11 @@ def provision(engines: tuple[str, ...] | None = None, *, upgrade: bool = False) 
 
         if patches_mod.load(eng):
             outputs.append(f"=== {eng} vendored patches ===\n" + "\n".join(patches_mod.apply(eng)))
+        # Runtime hooks ride along for the same reason: a sync rebuilds the
+        # venv, so a fresh machine must not need a separate install-hooks
+        # step to match a long-lived one. Idempotent; the hook itself is
+        # env-gated and no-ops if the engine internals it names have moved.
+        outputs.append(f"=== {eng} runtime hooks ===\n" + "\n".join(patches_mod.install_hooks(eng)))
         # On upgrade, pull the freshly-resolved lock back so the repo records
         # the new validated versions.
         if upgrade:

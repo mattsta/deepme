@@ -69,7 +69,7 @@ class QuantPolicy:
         wildcards so a bare token like 'IQ*' matches anywhere in the path
         (variant keys include a subdir prefix, so anchored fnmatch never hit)."""
         p = pat.upper()
-        if not (p.startswith("*") or p.startswith("/")):
+        if not (p.startswith(("*", "/"))):
             p = "*" + p
         if not p.endswith("*"):
             p = p + "*"

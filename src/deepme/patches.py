@@ -73,18 +73,17 @@ def load(engine: str = "sglang") -> list[Patch]:
     if not manifest.exists():
         return []
     raw = tomllib.loads(manifest.read_text())
-    out = []
-    for entry in raw.get("patch", []):
-        out.append(
-            Patch(
-                engine=engine,
-                name=entry["file"],
-                description=entry.get("description", ""),
-                upstream_version=entry.get("upstream_version", ""),
-                targets=tuple(entry.get("targets", [])),
-                sha256=dict(entry.get("sha256", {})),
-            )
+    out = [
+        Patch(
+            engine=engine,
+            name=entry["file"],
+            description=entry.get("description", ""),
+            upstream_version=entry.get("upstream_version", ""),
+            targets=tuple(entry.get("targets", [])),
+            sha256=dict(entry.get("sha256", {})),
         )
+        for entry in raw.get("patch", [])
+    ]
     return sorted(out, key=lambda p: p.name)
 
 

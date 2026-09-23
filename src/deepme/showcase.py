@@ -59,19 +59,18 @@ def load(profile: str) -> list[Clip]:
     if not path.exists():
         raise SystemExit(f"no showcase reel for {profile!r} — create {path} with [[clip]] entries")
     raw = tomllib.loads(path.read_text())
-    clips = []
-    for entry in raw.get("clip", []):
-        clips.append(
-            Clip(
-                name=entry["name"],
-                caption=entry.get("caption", ""),
-                prompt=entry["prompt"].strip(),
-                seconds=entry.get("seconds"),
-                seed=entry.get("seed"),
-                steps=entry.get("steps"),
-                params=dict(entry.get("params", {})),
-            )
+    clips = [
+        Clip(
+            name=entry["name"],
+            caption=entry.get("caption", ""),
+            prompt=entry["prompt"].strip(),
+            seconds=entry.get("seconds"),
+            seed=entry.get("seed"),
+            steps=entry.get("steps"),
+            params=dict(entry.get("params", {})),
         )
+        for entry in raw.get("clip", [])
+    ]
     if not clips:
         raise SystemExit(f"{path} declares no clips")
     return clips

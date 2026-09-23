@@ -5,7 +5,7 @@ a second process reading a half-written buffer, or two different tensors
 colliding on one key. Everything else can fall back to private memory.
 """
 
-import os
+from pathlib import Path
 
 import pytest
 
@@ -61,7 +61,7 @@ def _fake(nbytes=64):
 
     def map_shared(path, n):
         # Stand in for a file-backed tensor: create the file at full size.
-        with open(path, "wb") as f:
+        with Path(path).open("wb") as f:
             f.truncate(n)
         made["mapped"].append(path)
         return f"tensor@{path}"
@@ -171,9 +171,9 @@ def test_the_build_is_serialised_so_only_one_process_fills(store):
 
 def test_paths_are_namespaced_per_key(store):
     data, ready, lock = sharedstore.paths("abc")
-    assert os.path.basename(data) == "abc.bin"
-    assert os.path.basename(ready) == "abc.ready"
-    assert os.path.basename(lock) == "abc.lock"
+    assert Path(data).name == "abc.bin"
+    assert Path(ready).name == "abc.ready"
+    assert Path(lock).name == "abc.lock"
 
 
 def test_orphaned_segments_are_reported_not_silently_held(monkeypatch, store):

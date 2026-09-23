@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+from pathlib import Path
 
 import httpx
 
@@ -252,7 +253,9 @@ async def job_events(job_id: str, request: Request) -> Response:
                         {
                             "job_id": ticket_id,
                             "status": "failed",
-                            "error": ticket.error,
+                            # Same error shape as the poll path: one wire
+                            # vocabulary, whichever way a client watches.
+                            "error": {"message": ticket.error or "the replica refused it"},
                             "billable": False,
                         }
                     )
@@ -774,14 +777,12 @@ def _retention_pass() -> None:
     outputs = pathlib.Path(WORK_DIR) / "outputs"
     inputs = pathlib.Path(WORK_DIR) / "inputs"
     with contextlib.suppress(OSError):
-        for p in outputs.iterdir():
-            if p.is_file():
-                entries.append((str(p), p.stem, p.stat().st_mtime))
+        entries.extend(
+            (str(p), p.stem, p.stat().st_mtime) for p in outputs.iterdir() if p.is_file()
+        )
     with contextlib.suppress(OSError):
-        for p in inputs.iterdir():
-            if p.is_file():
-                # Staged uploads have no artifact id: global TTL only.
-                entries.append((str(p), "", p.stat().st_mtime))
+        # Staged uploads have no artifact id: global TTL only.
+        entries.extend((str(p), "", p.stat().st_mtime) for p in inputs.iterdir() if p.is_file())
     open_ids = {j for j, _u, _t, _c in bal.open_jobs()}
     doomed = _retention_candidates(
         entries,
@@ -794,7 +795,7 @@ def _retention_pass() -> None:
     reclaimed = 0
     for path in doomed:
         with contextlib.suppress(OSError):
-            os.remove(path)
+            Path(path).unlink()
             retention_deleted += 1
             reclaimed += 1
             print(f"retention: reclaimed {path}", flush=True)
@@ -1065,9 +1066,7 @@ async def jobs() -> JSONResponse:
     items; operators own the SYSTEM, and this answers "what is running
     right now" without owning any client.
     """
-    running = []
-    for j in bal.running_jobs():
-        running.append({**j, **_job_meta.get(j["job_id"], {})})
+    running = [{**j, **_job_meta.get(j["job_id"], {})} for j in bal.running_jobs()]
     queued = []
     for t in admission.waiting():
         body = t.body.get("body") or {}

@@ -317,7 +317,7 @@ def render_unit(spec: RunSpec, *, cpus_csv: str = "") -> str:
     )
     # Profile env last so a deployment can override an engine default.
     extra_env += "".join(f'Environment="{k}={v}"\n' for k, v in spec.env)
-    unit = f"""\
+    return f"""\
 # X-DEEPME-GPUS={gpus_csv}
 # X-DEEPME-CPUS={cpus_csv}
 # X-DEEPME-RAM={spec.accounted_ram_gib}
@@ -345,7 +345,6 @@ LimitNOFILE=1048576
 KillMode=mixed
 TimeoutStopSec=60
 """
-    return unit
 
 
 def stop(spec: RunSpec) -> None:

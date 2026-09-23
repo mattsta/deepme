@@ -21,6 +21,7 @@ import json
 import os
 import struct
 import sys
+from pathlib import Path
 
 # Bytes per element, by safetensors dtype name.
 WIDTH = {
@@ -45,8 +46,8 @@ WIDTH = {
 }
 
 
-def shard_header(path: str) -> dict:
-    with open(path, "rb") as f:
+def shard_header(path: str | Path) -> dict:
+    with Path(path).open("rb") as f:
         raw = f.read(8)
         if len(raw) < 8:
             return {}
@@ -66,7 +67,7 @@ def measure(root: str) -> dict:
         rel = os.path.relpath(dirpath, root)
         comp = out.setdefault(rel, {"bytes": 0, "tensors": 0, "dtypes": {}})
         for name in shards:
-            for tname, meta in shard_header(os.path.join(dirpath, name)).items():
+            for tname, meta in shard_header(Path(dirpath) / name).items():
                 if tname == "__metadata__" or not isinstance(meta, dict):
                     continue
                 dtype = meta.get("dtype", "BF16")

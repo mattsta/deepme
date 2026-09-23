@@ -1,9 +1,14 @@
 # API User Guide
 
-Two OpenAI-compatible endpoints, same bearer key (`.deepme/api_key`):
+Three OpenAI-compatible endpoints:
 
-- `http://<host>:8000/v1` — direct engine API, unguarded
-- `http://<host>:8001/v1` — output-guarded proxy (forbidden-pattern firewall)
+- `http://<host>:8080/v1` — the **gateway**: the platform entry point.
+  Routes by model + task, queues when the fleet is busy, survives fleet
+  resizes. All video/service traffic goes here.
+- `http://<host>:8000/v1` — direct text-LLM engine API, unguarded (bearer
+  key `.deepme/api_key`)
+- `http://<host>:8001/v1` — output-guarded text proxy (forbidden-pattern
+  firewall, same bearer key)
 
 Model name = the profile's `served_name` (`deepme model list`). Sampling
 defaults per model card: see the profile's `[sampling]`.
@@ -71,28 +76,32 @@ Reasoning content (when the model emits it) arrives in
 
 ## Video generation
 
-Diffusion profiles serve a job API on their own port, not a chat API. A clip
-takes minutes, so the request returns an id and you poll it.
+Video is a job API, not a chat API. A clip takes minutes, so the request
+returns an id and you poll it. Talk to the **gateway (:8080)** — it routes
+on `model` + `task`, load-balances across replicas, queues when everything
+is busy, and keeps your job reachable across fleet resizes. (Hitting a
+replica port directly bypasses all of that.)
 
 ```python
 import httpx, time
 
 key = open(".deepme/api_key").read().strip()
 h = {"Authorization": f"Bearer {key}"}
-base = "http://<host>:8030/v1/videos"
+base = "http://<host>:8080/v1/videos"
 
-job = httpx.post(
+r = httpx.post(
     base,
     headers=h,
-    timeout=3600,
+    timeout=120,
     json={
         "model": "h3-video",
         "prompt": "a corgi surfing a wave at sunset, cinematic",
         "seconds": 4,
     },
-).json()
+)
+job = r.json()
 
-while job["status"] not in ("completed", "failed"):
+while job["status"] not in ("completed", "failed", "cancelled", "error"):
     time.sleep(5)
     job = httpx.get(f"{base}/{job['id']}", headers=h).json()
 
@@ -100,19 +109,35 @@ mp4 = httpx.get(f"{base}/{job['id']}/content", headers=h, timeout=600).content
 open("out.mp4", "wb").write(mp4)
 ```
 
+**When the fleet is busy you get `202` instead of `200`**, and the id is a
+`q_` queue ticket rather than a `vid_` job id. Poll it exactly the same way
+— while it waits the body carries `queue_position` and `billable: false`;
+once a replica takes it, the same id transparently follows the real job
+(including `/content`), and the body's `id` switches to the real `vid_` id.
+`DELETE /v1/queue/{ticket}` abandons an unstarted ticket free of charge;
+`?queue=false` on the POST makes a busy fleet answer `503` instead of
+queueing. Full protocol: [INTERNAL-API.md](INTERNAL-API.md) §4.
+
+**Fetch promptly**: outputs are retained 6 hours if never downloaded, and
+deleted 1 hour after the first download.
+
 Send only the parameters you mean to override — each release ships tuned
-defaults for resolution and step count. Accepted fields include `seconds`,
-`size` (`1280x720`), `num_frames`, `fps`, `num_inference_steps`, `seed`, and
-`negative_prompt`. `multipart/form-data` to the same route adds image
-conditioning via `input_reference`.
+defaults for resolution and step count. The accepted field set is per model
+card; for the deployed MiniMax-H3 profiles the validator accepts exactly
+`{task, prompt, conditions, target, flow_shift, audio_flow_shift, seed,
+num_inference_steps}` (plus the CLI-level `seconds`, which sets
+`target.duration_seconds`) and **silently discards everything else** —
+including `size`, `fps` and `num_frames`. Image conditioning is a JSON
+`conditions` array of `data:` URIs or http(s) URLs (see Conditioning modes
+below); there is no multipart upload.
 
-The `model` field is informational: a diffusion server hosts exactly one
-pipeline and dispatches every request to it.
+The `model` field matters at the gateway: it routes on `model` + `task` and
+answers `400` when it cannot resolve them. (Only on a direct single-pipeline
+replica hit is it informational.)
 
-MiniMax-H3 additionally accepts the fields from its model card — `task`
-(`t2va` for text-only, `fl2va` with `conditions` for frame conditioning), a
-`target` object (`short_edge`, `aspect_ratio`, `duration_seconds`),
-`flow_shift` / `audio_flow_shift`, and `num_outputs_per_prompt` (1–10):
+MiniMax-H3's card fields — `task` (`t2va` for text-only, `fl2va` with
+`conditions` for frame conditioning), a `target` object (`short_edge`,
+`aspect_ratio`, `duration_seconds`), and `flow_shift` / `audio_flow_shift`:
 
 ```jsonc
 {
@@ -124,7 +149,7 @@ MiniMax-H3 additionally accepts the fields from its model card — `task`
     "aspect_ratio": "16:9",
     "duration_seconds": 5,
   },
-  "num_inference_steps": 50,
+  "num_inference_steps": 49,
   "flow_shift": 12.0,
   "audio_flow_shift": 3.0,
   "seed": 1101,
@@ -133,9 +158,10 @@ MiniMax-H3 additionally accepts the fields from its model card — `task`
 
 Output is H.264 video at 24fps with AAC stereo audio at 32kHz, in one MP4.
 
-The CLI does the whole loop with a live progress bar (step count, rate and
-ETA scraped from the engine — the job API itself only reports 0% then 100%),
-saves the file, and records the run:
+The CLI does the whole loop with a live progress bar, saves the file, and
+records the run. API callers get the same stage detail from
+`GET /v1/videos/{id}/events` (SSE per-job progress) or the platform-wide
+`/v1/jobs` — the bare poll body itself only reports 0% then 100%:
 
 ```bash
 uv run deepme generate -m h3-video "a corgi surfing at sunset" --seconds 4
@@ -172,8 +198,8 @@ passed through as-is.
 
 ### Speed and quality knobs
 
-- `--steps N` (`num_inference_steps`, default 50) is the main lever — cost is
-  linear in steps.
+- `--steps N` (`num_inference_steps`, default 49: 50 sigma points → 49
+  denoise iterations) is the main lever — cost is roughly linear in steps.
 - `--quality high` requests Cache-DiT step skipping (~1.4x). **It fails closed
   on our hardware**: the engine only accepts it on the audited 4xH200 resident
   deployment (`num_gpus=4`, `performance_mode=speed`, no layerwise offload,
@@ -226,12 +252,31 @@ Upstream engine death mid-stream ends cleanly with
 
 ## Observability
 
-- `GET /metrics` (:8000) — Prometheus: prefix-cache hit rate, KV usage,
+Platform (gateway :8080 — see [INTERNAL-API.md](INTERNAL-API.md) §7 for
+shapes):
+
+- `GET /v1/capacity` — free slots, queue depth and ETA per task, live
+- `GET /v1/jobs` — every running/queued/recent job with its parameters
+- `GET /v1/events` — SSE firehose of every lifecycle transition
+- `GET /v1/videos/{id}/events` — per-job progress SSE (stages, position)
+- `GET /v1/pricing` — the deployed price table with derivation
+- `GET /metrics` — Prometheus text, aggregated across fleets with
+  `fleet="..."` labels
+
+Text engine (:8000):
+
+- `GET /metrics` — Prometheus: prefix-cache hit rate, KV usage,
   TTFT/latency histograms
 - `X-Request-Id` response headers for log correlation
-- `uv run deepme runs` — operation ledger with full specs and outcomes
+
+Operator: `uv run deepme top` (one-screen live view),
+`uv run deepme runs` — operation ledger with full specs and outcomes.
 
 ## Security note
 
-Plain HTTP + bearer key. Beyond trusted networks, tunnel
-(`ssh -L 8000:localhost:8000 <host>`) or firewall the ports.
+Plain HTTP. The text endpoints (:8000/:8001) check the bearer key; the
+gateway and balancers (:8080, :9100/:9200) bind `0.0.0.0` and **inject the
+platform's key when a caller sends none** — the video path is effectively
+unauthenticated at those layers. Beyond trusted networks, tunnel
+(`ssh -L 8080:localhost:8080 <host>`, same for 8000/8001) or firewall all
+of 8000, 8001, 8080 and 9100/9200.

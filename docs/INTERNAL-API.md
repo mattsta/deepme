@@ -195,8 +195,10 @@ Rejected at submission with `400`, never mid-generation:
 | `num_inference_steps`     | `>= min_steps` from discovery (2 for H3)            |
 
 Fields outside `{task, prompt, conditions, target, flow_shift,
-audio_flow_shift, seed}` are **discarded silently by the engine** — notably
-`num_frames`, `fps` and `size`. Do not rely on them.
+audio_flow_shift, seed, num_inference_steps}` are **discarded silently by
+the engine** — notably `num_frames`, `fps` and `size`. Do not rely on them.
+(`priority` is consumed by the BALANCER's queue, never forwarded — it is
+real, just not an engine field.)
 
 Measured envelope: the largest legal request (15s at 21:9) peaks at 26.7GiB of
 32.6GiB VRAM, so every valid combination fits.
@@ -239,7 +241,10 @@ and `billable` flips to `true`. Everything before it costs nothing.
 
 The upstream engine reports `queued` from submission until `completed` with
 nothing between, which is why `queue_position` exists — it is the only way to
-distinguish _generating_ from _waiting behind other work_.
+distinguish _generating_ from _waiting behind other work_. It appears in
+ticket-poll bodies and on the SSE stream; once a real job id takes over, the
+poll body is the engine's own (proxied untouched) and does not carry it —
+watch `/v1/events` or `/v1/jobs` for position after handover.
 
 `{id}` may be a `q_` ticket. While it waits you get the queued shape; once a
 replica takes it, the same id transparently follows the real job — including
@@ -323,14 +328,22 @@ Two pieces make that safe.
       "model": "minimax-h3",
       "profile": "h3-video",
       "tasks": ["fl2va", "t2va"],
+      "url": "http://127.0.0.1:9100",
       "replicas": 3,
       "healthy": 3,
+      "accepting_replicas": 3,
+      "draining": 0,
       "busy": 1,
       "free": 2,
       "queued": 0,
       "accepting": true,
       "reachable": true,
       "mean_job_s": 842.9,
+      "disk": {
+        "free_gb": 812.4,
+        "used_pct": 57.1,
+        "watermark_exceeded": false
+      },
       "running": [
         {
           "job_id": "vid_…",
@@ -360,7 +373,8 @@ Two pieces make that safe.
 
 - **`free` is the contract**: the number of requests that will start
   immediately. One job per replica — these engines process a single request
-  at a time — so `free` is healthy replicas with nothing in flight.
+  at a time — so `free` is healthy, non-draining replicas with nothing in
+  flight (a replica finishing its last job before leaving is never `free`).
 - **`reachable: false` always reports `free: 0`.** A fleet that cannot be
   asked is not a fleet with spare capacity; the safe reading is built in so a
   scheduler cannot submit into a dead fleet.
@@ -381,8 +395,9 @@ Two pieces make that safe.
   appear (replicas finishing their last job before leaving), and a task can
   vanish from `accepting` entirely when its fleet is removed — or appear
   minutes later. Treat every poll as the current truth rather than caching
-  the topology; `/v1/models` and `/v1/pricing` move with it (a removed
-  task's quote becomes `available: false`).
+  the topology; `/v1/models` and `/v1/pricing` move with it — a removed
+  task disappears from the quote entirely, while `available: false` marks a
+  task whose fleet is still routed but currently unreachable.
 
 ### `?queue=false` — refuse rather than hold
 
@@ -390,21 +405,25 @@ Two pieces make that safe.
 POST /v1/videos?queue=false
 ```
 
-Returns `503` with `Retry-After` instead of a `202` ticket when nothing is
-free. **Use this if you run your own queue.** Two queues for the same work is
-the failure mode: ours would hold requests your scheduler still believes are
-its own to order, cancel and bill for. Refusing keeps one authority.
+Returns `503` with `Retry-After` instead of a `202` ticket whenever the
+fleet is full **or any platform-queue ticket is waiting** (§2's admission
+rule — a freed slot always serves the queue head first). **Use this if you
+run your own queue.** Two queues for the same work is the failure mode:
+ours would hold requests your scheduler still believes are its own to
+order, cancel and bill for. Refusing keeps one authority.
 
 ```json
 {
-  "detail": "all replicas busy and queueing was declined",
-  "free": 0,
+  "detail": "all replicas busy or queued work is ahead of you — queueing was declined",
+  "free": 1,
+  "waiting": 3,
   "retry_hint_s": 118
 }
 ```
 
 `retry_hint_s` is the soonest-finishing job's ETA, so a backoff can be
-informed rather than fixed.
+informed rather than fixed. `waiting` is the platform queue's depth — while
+it is non-zero, `free > 0` does NOT mean your submission will be accepted.
 
 ### The loop
 
@@ -413,6 +432,7 @@ while (true) {
   const cap = await get("/v1/capacity"); // one round-trip
   for (const fleet of cap.fleets) {
     if (!fleet.reachable) continue;
+    if (fleet.queued > 0) continue; // platform queue drains first — back off
     for (let i = 0; i < fleet.free; i++) {
       const job = myQueue.popHighestPriorityFor(fleet.tasks); // YOUR policy
       if (!job) break;
@@ -420,7 +440,7 @@ while (true) {
       if (r.status === 503) {
         myQueue.push(job);
         break;
-      } // lost the race
+      } // lost the race, or queued work got ahead — the body says which
       myTracking.set(r.body.id, job);
     }
   }
@@ -501,7 +521,9 @@ never typed into code.
 
 ---
 
-## 4c2. Artifact retention
+---
+
+## 4d. Artifact retention
 
 Generated files are reclaimed on the platform's own clock — nothing
 accumulates until a full disk fails generations:
@@ -524,7 +546,7 @@ audit` shows what is on disk right now.
 **Design your client to download promptly and treat the local copy as the
 copy.** The server is a buffer, not a library.
 
-## 4d. Operations endpoints
+## 4e. Operations endpoints
 
 Diagnostics rather than scheduling. Do not poll `/balancer/stats` in a control
 loop — it reaps stale jobs before answering, which contacts replicas.
@@ -537,11 +559,11 @@ loop — it reaps stale jobs before answering, which contacts replicas.
 
 Operator observability (independent of any client):
 
-| call                                                | for                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GET /v1/jobs` (gateway: per fleet; balancer: flat) | every job WITH what it is — running `{job_id, backend, elapsed_s, eta_s, task, prompt, seconds, via}`, queued `{ticket, position, priority, task, prompt}`, and the last 50 terminal `{status, closed_by, finished_at, ...}`. Request metadata is captured by the balancer at submission — the engine records none                                                                                                                                                                   |
-| `GET /metrics` (both)                               | Prometheus text exposition; the gateway aggregates with `fleet="..."` labels. Point scrapers here                                                                                                                                                                                                                                                                                                                                                                                    |
-| `GET /v1/events` (both; SSE)                        | the FIREHOSE: every lifecycle transition pushed live — `queued`/`started`/`handover`/`terminal` (with `closed_by`)/`cancelled`/`rejected`, plus `fleet` (attach/revive), `retention`, `fleet_down`, `gap`. Gateway multiplexes all fleets with a `fleet` tag and self-healing reconnects. `?since=<seq>` replays the 500-event ring for reconnect catch-up; `?limit=N` makes a bounded tap; a slow subscriber gets a `gap` marker, never back-pressure. Heartbeat comments every 15s |
+| call                                                | for                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/jobs` (gateway: per fleet; balancer: flat) | every job WITH what it is — running `{job_id, backend, elapsed_s, eta_s, task, prompt, seconds, via}`, queued `{ticket, position, priority, task, prompt}`, and the last 50 terminal `{status, closed_by, finished_at, ...}`. Request metadata is captured by the balancer at submission — the engine records none                                                                                                                                                                                                                                                                                                |
+| `GET /metrics` (both)                               | Prometheus text exposition; the gateway aggregates with `fleet="..."` labels. Point scrapers here                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `GET /v1/events` (both; SSE)                        | the FIREHOSE: every lifecycle transition pushed live — `queued`/`started`/`handover`/`terminal` (with `closed_by`)/`cancelled`/`rejected`, plus `fleet` (attach/revive), `retention`, `fleet_down`, `gap`. Gateway multiplexes all fleets with a `fleet` tag and self-healing reconnects, and honors `?limit=N` (a bounded tap) only. On the **balancer** endpoint, `?since=<seq>` additionally replays the 500-event ring for reconnect catch-up, and a slow subscriber gets a `gap` marker, never back-pressure (seq numbers are per-balancer, so replay cannot exist at the mux). Heartbeat comments every 15s |
 
 `deepme top [--watch] [--json]` renders `/v1/jobs` with live denoise stages
 per running job — the operator's one-screen answer to "what is the platform
@@ -622,7 +644,8 @@ lives in `deploy/fleets/*.toml`:
 | `production` | h3-video ×3 + h3-ref ×1 | −25% base, premium tier available    |
 | `even`       | ×2 + ×2                 | even split                           |
 
-Measured: ~800s for a 5s clip at the default 49 steps (superlinear in
+Measured: ~800s for a 5s clip at the default schedule (50 sigma points →
+49 denoise iterations; both numbers appear in logs) (superlinear in
 duration — 15s costs 1.51× linear); four concurrent clips in 18m28s
 against ~62m serial. Roughly **17 clips/hour, ~170 overnight** at four
 replicas. Cost is linear in `num_inference_steps`.
@@ -649,5 +672,6 @@ uv run deepme store status|clear       # shared weight store
 uv run deepme watch                    # health transitions to the ledger
 ```
 
-See `RUNBOOK.md` §7d–7e for fleet operations and the vendored-patch workflow,
+See `RUNBOOK.md` §7.4–7.6 for fleet operations, §7.7 for the vendored-patch
+workflow, §7.8 for economics/capacity/artifacts,
 and `README.md` for the measured performance and memory characteristics.

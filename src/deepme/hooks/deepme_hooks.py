@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+from pathlib import Path
 
 logger = logging.getLogger("deepme.hooks")
 
@@ -143,7 +144,7 @@ def _shared_allocator(model_id: str):
 
     original = torch.empty
     state = {"ordinal": 0, "shared": 0, "bytes": 0}
-    os.makedirs(STORE_DIR, exist_ok=True)
+    Path(STORE_DIR).mkdir(parents=True, exist_ok=True)
 
     def patched(*args, **kwargs):
         pinned = kwargs.get("pin_memory")
@@ -156,7 +157,7 @@ def _shared_allocator(model_id: str):
             nbytes = numel * torch.empty(0, dtype=dtype).element_size()
             state["ordinal"] += 1
             key = _key(model_id, state["ordinal"], str(dtype), numel)
-            path = os.path.join(STORE_DIR, f"{key}.bin")
+            path = str(Path(STORE_DIR) / f"{key}.bin")
             tensor = _shared_tensor(torch, path, nbytes, numel, dtype)
             _register_pinned(torch, tensor, nbytes)
             state["shared"] += 1

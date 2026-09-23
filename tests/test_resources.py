@@ -11,7 +11,7 @@ def cap8() -> Capacity:
     return Capacity(
         gpus=tuple(range(8)),
         numa={
-            0: tuple(range(0, 64)) + tuple(range(128, 192)),
+            0: tuple(range(64)) + tuple(range(128, 192)),
             1: tuple(range(64, 128)) + tuple(range(192, 256)),
         },
         ram_gib=503.0,

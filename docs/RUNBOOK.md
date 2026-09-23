@@ -59,6 +59,21 @@ Diagnosis order for a crash-looping service: `serve diag` (real traceback) →
 `doctor` (import layer) → `jit-heal` (JIT caches) → check the toolchain
 facts in README ("Hard-won toolchain facts") before changing anything.
 
+**Fleet / gateway incidents** (the video-platform failure modes):
+
+- Before ANY balancer restart: `curl :91xx/v1/queue` — a restart destroys
+  every waiting ticket. `deepme balancer start` refuses over live state;
+  `--force` overrides deliberately and destroys the queue. (§7.6)
+- Replicas wedged / phantom occupancy: the maintenance loop self-heals in
+  ≤60s (reconcile → revive → pump); `deepme top` shows what every job is,
+  `deepme job-progress <id>` one job's stage. Stuck beyond that: §7.5's
+  reconcile — re-running the same `fleet switch` converges from any state.
+- `/v1/pricing` returning `503 "no pricing table"`: operator condition —
+  `deepme gateway start` (or a reload) republishes it. (§7.8)
+- Never `serve stop`/`scale` a profile with jobs or queue: the guard
+  refuses; drain via `deepme fleet switch` instead. `--force` kills paying
+  work.
+
 `watch` samples every deployment on an interval and writes each transition to
 the runs ledger (`uv run deepme runs`), so an outage that happened while
 nobody was looking is still on the record. It tracks systemd restart counts
@@ -117,7 +132,7 @@ uv run deepme bench -m <p> -c 1                  # compare against the ledger
 If the upgrade regresses, `git checkout deploy/engines/<engine>/uv.lock` and
 `deepme setup -e <engine>` restores the validated versions exactly.
 
-## 7b. CPU colocation (GGUF on cores, alongside GPU models)
+## 7.1. CPU colocation (GGUF on cores, alongside GPU models)
 
 ```sh
 uv run deepme model add <org/Repo-GGUF> --name <p> --port 8010
@@ -132,7 +147,7 @@ Requires the llama.cpp engine: `uv run deepme setup -e llamacpp` (CUDA source
 build; also usable for GPU-offloaded GGUF). Verify with `deepme resources`
 (claims table) and `systemctl show <unit> -p AllowedCPUs -p MemoryMax`.
 
-## 7. Multi-model (NxY) operation
+## 7.2. Multi-model (NxY) operation
 
 Give each profile a disjoint `gpus = [...]` list and distinct `port`.
 Non-overlapping profiles coexist; `serve start`/`switch` only displaces
@@ -146,14 +161,14 @@ would not fit on the whole machine. Check `deepme model show -m <p>`
 actually free — RAM is claimed too, so two offload-heavy models can conflict
 without sharing a single GPU.
 
-## 7c. Diffusion / media models
+## 7.3. Diffusion / media models
 
 Serve them exactly as the engine vendor publishes for your hardware —
 sglang's cookbook has a per-GPU-model recipe, and its auto-tuner assumes
 datacenter cards. Put the recipe in `[serve.engine_args]` with a link.
 Verify with `deepme generate` (produces a real file), not just health.
 
-## 7d. Replica fleets (max concurrency for one model)
+## 7.4. Replica fleets (max concurrency for one model)
 
 Media engines serve ONE request at a time, so throughput comes from running
 several copies. Measured on 8x32GiB: four H3 replicas in 172GiB of host RAM,
@@ -185,7 +200,7 @@ has to cover the LOAD PEAK, which is several times the resting size, so every
 cap was a guess that cost a restart to discover. Set `ram_gb` again only if a
 model genuinely threatens the machine.
 
-## 7e2. Changing the fleet mix at runtime
+## 7.5. Changing the fleet mix at runtime
 
 ```sh
 uv run deepme fleet list                 # available mixes
@@ -204,7 +219,9 @@ live unit claims (never from what was applied last), computes the delta, and:
 - **starts** the arrivals and attaches them to their balancer AT RUNTIME —
   the balancer is not restarted, so waiting tickets and job tracking
   survive the resize;
-- **re-points the gateway** only when the route set actually changed.
+- **re-points the gateway** on any shape change — the frozen catalog and
+  replica counts in `/gateway/discover` go stale on any resize, so only a
+  true no-op switch skips the restart.
 
 It refuses to remove a profile that still has queued tickets no remaining
 fleet can serve (`--force` abandons them, explicitly — the abandoned ticket
@@ -234,7 +251,7 @@ Runtime membership is persisted next to the balancer (`backends-<profile>.json`)
 and wins over the deploy-time list on a crash-restart; `balancer start` deletes
 it — an explicit start is a fresh freeze.
 
-## 7f. Service layer (gateway, queue, events)
+## 7.6. Service layer (gateway, queue, events)
 
 One address in front of every fleet. Start it AFTER the balancers — it reads
 their addresses from the registry and records routes at setup time.
@@ -259,7 +276,7 @@ every customer ETA, the queue wait estimate and the stale-job threshold. If it
 reads in fractions of a second for a model whose generations take minutes, the
 occupancy accounting is wrong, not the model — see `Balancer.reserve`.
 
-## 7e. Shared weight store (vendored engine fork)
+## 7.7. Shared weight store (vendored engine fork)
 
 Layerwise offload keeps weights in host RAM as pinned per-process buffers, so
 N replicas held N identical copies (96GiB per rank) and the box capped at 2.
@@ -300,7 +317,7 @@ scales with store size, so a 4-replica cycle is minutes, not seconds
 that made them: a model you will not serve again holds its store until
 `deepme store clear` runs.
 
-## 7g. Economics, capacity and artifacts (daily operations)
+## 7.8. Economics, capacity and artifacts (daily operations)
 
 ```sh
 uv run deepme capacity --watch     # free slots, queues, running, disk — live
