@@ -45,7 +45,7 @@ def record(
         "spec": asdict(spec) if spec else None,
         "detail": detail or {},
     }
-    (RUNS_DIR / f"{run_id}.json").write_text(json.dumps(entry, indent=2))
+    config.write_text_atomic(RUNS_DIR / f"{run_id}.json", json.dumps(entry, indent=2))
     summary = {k: entry[k] for k in ("id", "time", "action", "profile", "outcome")}
     with LEDGER.open("a") as f:
         f.write(json.dumps(summary) + "\n")

@@ -7,13 +7,20 @@ DEEPME_* environment variables where noted.
 
 from __future__ import annotations
 
+import functools
+import json
 import os
 import secrets
+import tempfile
 import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = REPO_ROOT / ".deepme"
+# Modules the balancer and gateway BOTH run. They are deployed as flat files
+# importing siblings by bare name, so anything shared cannot live inside
+# either service's directory — it is copied into both by their ctl modules.
+SHARED_DIR = REPO_ROOT / "src" / "deepme" / "shared"
 CONFIG_FILE = STATE_DIR / "config.toml"
 
 # ---------------------------------------------------------------------------
@@ -25,33 +32,86 @@ CONFIG_FILE = STATE_DIR / "config.toml"
 # ---------------------------------------------------------------------------
 
 
+def write_text_atomic(path: Path, text: str) -> None:
+    """Publish `text` at `path` or leave the previous content untouched.
+
+    THE write-then-rename implementation for the whole project. Six sites
+    hand-rolled this and three of them were not actually atomic — including
+    the story runner's state file, the sole record of a multi-hour run.
+    `os.replace` is atomic within a filesystem, and the fsyncs mean the
+    guarantee survives a power loss, not just a killed process: without
+    them the rename can land before the data.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        # os.fdopen, not Path.open: mkstemp already returns an OPEN fd, and
+        # re-opening by name would race a concurrent writer for the path.
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+        # The rename itself has to reach the disk, or a crash can resurrect
+        # the old entry with the new file's data already gone.
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _file_config() -> dict:
     if CONFIG_FILE.exists():
-        return tomllib.loads(CONFIG_FILE.read_text())
+        try:
+            return tomllib.loads(CONFIG_FILE.read_text())
+        except (tomllib.TOMLDecodeError, OSError) as exc:
+            raise SystemExit(
+                f"{CONFIG_FILE} is unreadable ({exc}) — fix or delete it, then "
+                f"re-run `uv run deepme config init --host <ip>`"
+            ) from None
     return {}
+
+
+def section(name: str) -> dict:
+    """One section of the config file. The public read half — `profiles`
+    was reaching into `_file_config` directly, which is why no caching or
+    validation could ever be added here."""
+    return dict(_file_config().get(name, {}))
 
 
 def _toml_value(v) -> str:
     if isinstance(v, str):
-        return f'"{v}"'
+        # TOML basic strings share JSON's escape grammar, and stdlib ships
+        # no TOML writer — so json.dumps IS the correct escaper. Wrapping
+        # raw text in quotes produced a file tomllib then refused to parse
+        # for any value containing a quote, backslash or newline, and
+        # `_file_config` is called by every command including the one that
+        # would repair it.
+        return json.dumps(v)
     if isinstance(v, bool):
         return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
     if isinstance(v, list):
         return "[" + ", ".join(_toml_value(x) for x in v) + "]"
-    return str(v)
+    raise TypeError(f"cannot serialise {type(v).__name__} to TOML: {v!r}")
 
 
 def write_config(data: dict) -> None:
     """Serialize a nested {section: {k: v}} dict to .deepme/config.toml,
     preserving every section. The single writer for all config mutations."""
     lines = []
-    for section, body in data.items():
-        lines.append(f"[{section}]")
+    for section_name, body in data.items():
+        lines.append(f"[{section_name}]")
         for k, v in body.items():
             lines.append(f"{k} = {_toml_value(v)}")
         lines.append("")
-    STATE_DIR.mkdir(exist_ok=True)
-    CONFIG_FILE.write_text("\n".join(lines))
+    write_text_atomic(CONFIG_FILE, "\n".join(lines))
 
 
 def update_config(section: str, **kv) -> None:
@@ -144,16 +204,16 @@ PER_GPU_OVERHEAD_GIB = 3.0
 
 
 def cluster_gpu_count() -> int:
-    return int(_file_config().get("cluster", {}).get("gpus", 8))
+    return int(section("cluster").get("gpus", 8))
 
 
 def cluster_vram_gib() -> float:
-    return float(_file_config().get("cluster", {}).get("vram_gb", 32))
+    return float(section("cluster").get("vram_gb", 32))
 
 
 def cluster_ram_gib() -> float:
     """System RAM (for CPU-mode placements). Probed value wins when cached."""
-    cfg = _file_config().get("cluster", {})
+    cfg = section("cluster")
     if "ram_gb" in cfg:
         return float(cfg["ram_gb"])
     cache = STATE_DIR / "capacity.json"
@@ -179,13 +239,29 @@ def per_gpu_weight_budget_gib(gpu_mem: float | None = None) -> float:
 # ---------------------------------------------------------------------------
 
 
+@functools.cache
 def api_key() -> str:
-    """Return the shared API key, generating and persisting it on first use."""
+    """The shared API key, generated and persisted on first use.
+
+    Cached: this is called on EVERY request header build, and each call
+    was three syscalls (mkdir, exists, read) on the hot path of a poll
+    loop running per in-flight item.
+
+    Created with O_EXCL, not check-then-write: two batch worker threads
+    reaching a fresh checkout together both saw no file, generated
+    DIFFERENT keys and both wrote — so one thread's requests carried a key
+    the other had already replaced on disk, and only one was ever
+    provisioned to the server. Sporadic 401s on the first run. O_EXCL also
+    creates at 0600 directly, closing the window where the key was
+    world-readable between write and chmod.
+    """
     STATE_DIR.mkdir(exist_ok=True)
     key_file = STATE_DIR / "api_key"
-    if key_file.exists():
-        return key_file.read_text().strip()
     key = "dm-" + secrets.token_urlsafe(32)
-    key_file.write_text(key + "\n")
-    key_file.chmod(0o600)
+    try:
+        fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return key_file.read_text().strip()
+    with os.fdopen(fd, "w") as f:
+        f.write(key + "\n")
     return key

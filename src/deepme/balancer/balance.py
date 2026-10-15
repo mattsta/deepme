@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import itertools
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 
@@ -60,7 +61,7 @@ class Balancer:
     # a billing-relevant self-correction that must be countable, not silent.
     reaped: int = 0
     stats: dict[str, BackendStats] = field(default_factory=dict)
-    _owner: dict[str, str] = field(default_factory=dict)
+    _owner: OrderedDict[str, str] = field(default_factory=OrderedDict)
     # job id -> (backend, started at). Open jobs are what "busy" means here.
     _jobs: dict[str, tuple[str, float]] = field(default_factory=dict)
     # job id -> API collection ("videos"/"images"/...), for reconcile probes.
@@ -141,6 +142,13 @@ class Balancer:
     def backend_urls(self) -> list[str]:
         return list(self.stats)
 
+    # SUPERSEDED — no production caller. Occupancy spans the JOB, not the
+    # HTTP call: use reserve/release for the submission window and
+    # begin_job/end_job for the work itself. Timing a submission with this
+    # pair is the defect that reported mean_job_s of 0.1s while a replica
+    # was twenty minutes into a generation, corrupting every ETA, queue
+    # estimate and staleness threshold downstream. Kept only because the
+    # counter tests exercise the accounting through them.
     def start(self, url: str) -> float:
         self.stats[url].inflight += 1
         self.stats[url].started += 1
@@ -229,21 +237,30 @@ class Balancer:
         st.inflight += 1
         st.started += 1
 
-    def end_job(self, job_id: str, *, ok: bool = True) -> None:
+    def end_job(self, job_id: str, *, ok: bool = True) -> bool:
+        """Close a job's occupancy. True only if it was actually open.
+
+        The return is the dedupe signal for terminal accounting: several
+        paths (client poll, SSE watcher, reconciler, strikes) all observe
+        the same terminal status, and whoever closes it FIRST owns the
+        recent-ring entry — the rest must not re-record it, which double
+        counted every job and stripped its metadata (popped on first note).
+        """
         entry = self._jobs.pop(job_id, None)
         self._job_collections.pop(job_id, None)
         if entry is None:
-            return
+            return False
         url, began = entry
         st = self.stats.get(url)
         if st is None:
-            return
+            return True
         st.inflight = max(st.inflight - 1, 0)
         st.total_busy_s += max(time.monotonic() - began, 0.0)
         if ok:
             st.completed += 1
         else:
             st.failed += 1
+        return True
 
     def active_jobs(self) -> int:
         return len(self._jobs)
@@ -393,12 +410,37 @@ class Balancer:
 
     # -- job ownership -----------------------------------------------------
     def remember(self, job_id: str, url: str) -> None:
+        """Bind a job to its replica, LRU-bounded, sparing open jobs.
+
+        `move_to_end` is the OrderedDict operation for "this is the most
+        recently used" — the pop/reinsert dance said the same thing by
+        hand. Eviction still skips jobs that are currently open: an open
+        job's owner is load-bearing routing, and dropping it sent the next
+        poll through the owner probe.
+        """
         if not job_id:
             return
+        # An OPEN job's binding is authoritative and must never be
+        # overwritten by a different replica. Engine ids collide across
+        # replicas (they are minted per replica), so a stale sighting of the
+        # same number elsewhere used to silently re-point a live job at the
+        # replica holding an unrelated old artifact.
+        held = self._jobs.get(job_id)
+        if held is not None and held[0] != url:
+            return
+        if job_id in self._owner:
+            self._owner[job_id] = url
+            self._owner.move_to_end(job_id)
+            return
         if len(self._owner) >= self.max_jobs:
-            # Drop the oldest insertion; dicts preserve insertion order.
-            self._owner.pop(next(iter(self._owner)), None)
+            victim = next((old for old in self._owner if old not in self._jobs), None)
+            if victim is not None:
+                self._owner.pop(victim, None)
         self._owner[job_id] = url
+
+    def owners_snapshot(self) -> dict[str, str]:
+        """The whole owner map, for persistence across restarts."""
+        return dict(self._owner)
 
     def owner(self, job_id: str) -> str | None:
         """Which replica holds this job, or None if we must go looking."""

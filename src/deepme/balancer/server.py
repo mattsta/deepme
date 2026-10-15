@@ -19,8 +19,10 @@ BALANCER_API_KEY. Deployed to ~/deepme-runtime/balancer alongside balance.py.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import os
+from collections import deque
 from pathlib import Path
 
 import httpx
@@ -29,14 +31,31 @@ import httpx
 # wins depends on sys.path order at import time.
 from admission import (  # deployed next to this
     CANCELLED,
+    PRIORITY_HIGH,
+    PRIORITY_LOW,
     PRIORITY_NORMAL,
     REJECTED,
     SUBMITTED,
     AdmissionQueue,
 )
 from balance import Balancer  # deployed next to this file
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+# Shared with the gateway — see proxycore's docstring for why the owner
+# probe must not be maintained twice. Deployed next to this file too.
+from proxycore import (
+    TERMINAL_STATUSES,
+    AmbiguousOwner,
+    auth_headers,
+    collection_of,
+    content_headers,
+    find_owner,
+    is_content,
+    job_id_of,
+    safe_headers,
+    status_path,
+)
 
 BACKENDS = json.loads(os.environ.get("BALANCER_BACKENDS", "[]"))
 API_KEY = os.environ.get("BALANCER_API_KEY", "")
@@ -48,9 +67,37 @@ TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=None, pool=None)
 # bounded: they run inside the maintenance loop, and one wedged replica
 # holding a read open forever would freeze the very task that exists to heal
 # wedges (pump, reconcile and prune all die together).
-CTL_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+CTL_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+# Boot recovery blocks the port from binding, so it gets a much tighter
+# bound than ordinary control-plane work: a replica that cannot answer in
+# this window is reconciled by the maintenance beat instead of holding the
+# whole service in connection-refused.
+RECOVERY_TIMEOUT = httpx.Timeout(5.0, connect=2.0)
 
 DRAIN_S = 10.0
+
+# Maintenance failures are OPERATIONAL FACTS, exported in /metrics: the
+# liveness invariant is enforced by that loop, so a beat that dies must be
+# visible rather than merely absent.
+maintenance_errors = 0
+retention_errors = 0
+# Operational counters an incident actually asks for. /metrics carried only
+# gauges plus reaped/retention, so "why did submissions start failing" and
+# "which replica is degrading" had no alertable series at all.
+submit_rejected = 0  # replica said no (4xx/5xx)
+submit_ambiguous = 0  # transport died mid-accept; outcome unknown
+submit_requeued = 0  # connect-phase failure, safely returned to the queue
+owner_conflicts = 0  # two replicas claimed one id
+owner_rejections = 0  # a remembered binding failed verification
+# Running on a replica but absent from our job map when the sweep looked. Any
+# non-zero value means we were double-booking a GPU; a rising one means the
+# submit path is losing acceptances (chase submit_ambiguous first).
+orphans_adopted = 0
+fetches = 0
+fetch_failures = 0
+
+# Strong references to in-flight pump tasks (see _safe_pump).
+_pending_pumps: set = set()
 
 # ---------------------------------------------------------------------------
 # Artifact retention (the user-set policy, enforced by the platform):
@@ -68,6 +115,68 @@ RETENTION_FETCHED_TTL_S = float(os.environ.get("RETENTION_FETCHED_TTL_S", 3600))
 WORK_DIR = os.environ.get("DEEPME_WORK_DIR", "")
 # Every ~6 maintenance beats (~1min): a directory scan is cheap but not free.
 _RETENTION_EVERY_BEATS = 6
+# Ditto for the orphan sweep, which costs one /v1/videos listing per replica.
+# Slower than the reap because a ghost wastes a slot, not correctness, and the
+# listing grows with each replica's whole history.
+_ORPHAN_SWEEP_EVERY_BEATS = 6
+
+
+# Consecutive maintenance beats with ZERO accepting replicas before waiting
+# tickets are refused. ~5 minutes at DRAIN_S=10.
+#
+# The waiting ticket was the only unbounded object in this system — jobs are
+# bounded by strikes and stale_jobs, the owner map by max_jobs, the event ring
+# by maxlen, artifacts by retention, settled tickets by prune. A ticket on a
+# dead fleet was not: nothing could move it out of WAITING, because every path
+# to REJECTED lives inside _pump AFTER pick() returns a target, and pick()
+# returns None on a dead fleet — so the pump bails before reaching the code
+# that could refuse anything. Client-side, a queued ticket is deliberately
+# exempt from every stall verdict (waiting is legitimate, and killing queued
+# work on a timer is exactly what this platform refuses to do). The two
+# together deadlock permanently.
+#
+# This is a STRIKE COUNT, not a timeout, and the evidence is positive: zero
+# accepting replicas means no replica can EVER take this work, which is a
+# fact, not a guess about elapsed time. A single accepting replica resets it,
+# so a fleet switch or a blip cannot refuse legitimately queued work — the
+# drain would have to outlast every beat in the window. Set to 0 to disable
+# for a migration longer than the window.
+FLEET_DEAD_STRIKES = int(os.environ.get("FLEET_DEAD_STRIKES", "30"))
+_fleet_dead_beats = 0
+# Waiting tickets refused because nothing could ever serve them.
+submit_unservable = 0
+
+
+def _fail_unservable_tickets() -> None:
+    """Refuse waiting tickets once the fleet is provably unable to serve them.
+
+    Only NEVER-BILLED tickets can be touched: mark_rejected refuses to move a
+    SUBMITTING or SUBMITTED ticket, so work that reached a replica is safe by
+    construction.
+    """
+    global _fleet_dead_beats, submit_unservable
+    if not FLEET_DEAD_STRIKES:
+        return
+    if bal.capacity()["accepting_replicas"]:
+        _fleet_dead_beats = 0  # one live replica clears the whole count
+        return
+    _fleet_dead_beats += 1
+    if _fleet_dead_beats < FLEET_DEAD_STRIKES:
+        return
+    waiting = list(admission.waiting())
+    if not waiting:
+        return
+    detail = (
+        f"no replica has been able to accept work for "
+        f"{int(FLEET_DEAD_STRIKES * DRAIN_S)}s ({len(bal.stats)} attached, "
+        f"0 accepting) — this was never submitted and never billed; "
+        f"resubmit when capacity returns"
+    )
+    for ticket in waiting:
+        if admission.mark_rejected(ticket.ticket_id, detail):
+            submit_unservable += 1
+            _publish("rejected", ticket=ticket.ticket_id, error=detail[:120])
+    print(f"refused {len(waiting)} waiting ticket(s): {detail}", flush=True)
 
 
 @contextlib.asynccontextmanager
@@ -83,14 +192,14 @@ async def _lifespan(_app):
     import asyncio
 
     async def drain() -> None:
-        # Boot: rebuild occupancy from replica truth before anything routes.
-        with contextlib.suppress(Exception):
-            await _recover_occupancy()
+        # Declared once, up front: Python scopes `global` per FUNCTION, so a
+        # second declaration lower down is a SyntaxError, not a redundancy.
+        global maintenance_errors, retention_errors
         beats = 0
         while True:
             await asyncio.sleep(DRAIN_S)
             beats += 1
-            with contextlib.suppress(Exception):
+            try:
                 # Order matters: reconcile FIRST (frees slots the replicas
                 # say are done), revive lapsed backends, then pump into
                 # whatever is free, then prune. Together these enforce the
@@ -100,16 +209,60 @@ async def _lifespan(_app):
                 await _reap_stale_jobs()
                 await _revive_backends()
                 await _pump()
-                admission.prune()
+                # AFTER revive and pump, so a returning replica always gets
+                # first refusal on the work before anything is refused.
+                _fail_unservable_tickets()
+                # Tickets whose job is still running keep their binding —
+                # the caller was promised that id keeps working.
+                admission.prune(live_jobs={j for j, _u, _t, _c in bal.open_jobs()})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # COUNTED and NAMED, never silently swallowed. This
+                # sequence IS the liveness invariant; a blanket suppress
+                # turned a permanent violation (the pump never running
+                # again, every ticket waiting forever on an idle fleet)
+                # into something indistinguishable from a healthy beat.
+                maintenance_errors += 1
+                print(f"maintenance beat failed: {exc!r}", flush=True)
+            if beats % _ORPHAN_SWEEP_EVERY_BEATS == 0:
+                try:
+                    await _recover_occupancy(boot=False)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    maintenance_errors += 1
+                    print(f"orphan sweep failed: {exc!r}", flush=True)
             if beats % _RETENTION_EVERY_BEATS == 0:
-                with contextlib.suppress(Exception):
-                    _retention_pass()
+                try:
+                    # The WALK goes to a thread (slow, pure); the deletes
+                    # and the publish stay on the loop, which owns the
+                    # event ring, the subscriber queues and `_fetched`.
+                    _retention_apply(await asyncio.to_thread(_retention_plan))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    retention_errors += 1
+                    print(f"retention pass failed: {exc!r}", flush=True)
 
+    # BEFORE serving: occupancy must reflect replica truth or the first
+    # request routes onto a replica that is already generating. A
+    # create_task here only SCHEDULED the recovery, so startup completed
+    # with an empty job map — the double-booking this exists to prevent.
+    with contextlib.suppress(Exception):
+        await _recover_occupancy()
     task = asyncio.create_task(drain())
     try:
         yield
     finally:
+        # Cancel AND await: cancellation is only a request, and a pump
+        # abandoned mid-POST never ran its cleanup, leaving a ticket stuck
+        # in SUBMITTING and a reserved slot leaked across the restart.
         task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await client.aclose()
+        await ctl.aclose()
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -124,53 +277,56 @@ bal = Balancer(list(BACKENDS))
 # their CANCEL) to another customer's ticket on a different fleet. The boot
 # nonce keeps a restarted balancer from re-minting ids the gateway may still
 # map to the previous incarnation's customers.
-admission = AdmissionQueue(salt=f"{os.environ.get('BALANCER_NAME', 'b')}-{os.urandom(2).hex()}-")
+# 8 random bytes: the 2-byte nonce this started with left a 1-in-65536
+# cross-boot collision on the exact cross-customer routing the salt closes.
+admission = AdmissionQueue(salt=f"{os.environ.get('BALANCER_NAME', 'b')}-{os.urandom(8).hex()}-")
 client = httpx.AsyncClient(timeout=TIMEOUT)
 ctl = httpx.AsyncClient(timeout=CTL_TIMEOUT)
 
 # One vocabulary for "this job is over", shared by every code path. Two of
 # the four paths previously listed only two of the four words, so inline
 # cancellations opened occupancy that nothing would ever close.
-TERMINAL_STATUSES = ("completed", "failed", "cancelled", "error")
-
-# Job-scoped routes: "/v1/videos/{id}", ".../content". The id is the segment
-# straight after the collection name.
-_COLLECTIONS = ("videos", "images", "meshes")
 
 
-def _auth(request: Request) -> dict[str, str]:
-    """Forward the caller's credentials, or our own if it sent none."""
-    incoming = request.headers.get("authorization")
-    if incoming:
-        return {"authorization": incoming}
-    return {"authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+def require_key(request: Request) -> None:
+    """Gate the CONTROL PLANE (/balancer/*). Not /v1/*.
 
+    These routes change the fleet: attach, drain, detach. They were open to
+    anyone who could reach the port — and the balancer binds 0.0.0.0 — so a
+    single unauthenticated DELETE could tear the fleet down. `/v1/*` stays
+    ungated deliberately: it forwards the CALLER's credentials to the
+    engine, and gating it here would break the service layer's own auth.
 
-def _job_id(path: str) -> str | None:
-    parts = [p for p in path.split("/") if p]
-    for i, part in enumerate(parts):
-        if part in _COLLECTIONS and i + 1 < len(parts):
-            return parts[i + 1]
-    return None
-
-
-def _collection_of(path: str) -> str:
-    """Which API family a request belongs to, for reconcile probes later."""
-    for part in path.split("/"):
-        if part in _COLLECTIONS:
-            return part
-    return "videos"
-
-
-def _status_path(path: str, job_id: str) -> str:
-    """The cheap status URL for a job, whatever sub-resource was asked for.
-
-    Ownership must never be probed with the caller's own path: for
-    ".../{id}/content" that downloads the whole MP4 from every replica —
-    buffered, in full — just to find out which one has it.
+    Off when no key is configured, so a local/dev deployment is unchanged.
     """
-    head, _, _ = path.partition(f"/{job_id}")
-    return f"{head}/{job_id}"
+    if not API_KEY:
+        return
+    header = request.headers.get("authorization", "")
+    if header.removeprefix("Bearer ").strip() != API_KEY:
+        raise HTTPException(status_code=401, detail="control-plane routes require the platform key")
+
+
+def _log_bad_binding(job_id: str, target: str) -> None:
+    global owner_rejections
+    owner_rejections += 1
+    print(
+        f"owner map was WRONG: {target} does not hold {job_id} — binding "
+        f"dropped, re-probing (this is the misattribution guard firing)",
+        flush=True,
+    )
+    _publish("owner_rejected", job_id=job_id, backend=target)
+
+
+async def _owns(target: str, job_id: str, headers: dict) -> bool:
+    """Does this replica actually hold this id? Cheap status GET.
+
+    Unreachable counts as NOT verified: serving bytes on an unverified
+    binding is what delivered another job's video.
+    """
+    with contextlib.suppress(httpx.HTTPError, ValueError, TypeError, KeyError):
+        r = await ctl.get(f"{target}{status_path('/v1/videos/' + job_id, job_id)}", headers=headers)
+        return r.status_code == 200 and str(dict(r.json()).get("id") or "") == job_id
+    return False
 
 
 async def _find_owner(job_id: str, path: str, headers: dict) -> str | None:
@@ -184,19 +340,30 @@ async def _find_owner(job_id: str, path: str, headers: dict) -> str | None:
     route left pick() double-booking busy replicas while _all_busy() waved
     the whole former queue into engine-internal FIFOs.
     """
-    path = _status_path(path, job_id)
-    for st in bal.stats.values():
-        if not st.healthy:
-            continue
-        with contextlib.suppress(httpx.HTTPError):
-            r = await ctl.get(f"{st.url}{path}", headers=headers)
-            if r.status_code < 400:
-                bal.remember(job_id, st.url)
-                with contextlib.suppress(ValueError, TypeError, KeyError):
-                    if str(dict(r.json()).get("status") or "") not in TERMINAL_STATUSES:
-                        bal.begin_job(job_id, st.url)
-                return st.url
-    return None
+
+    def _ambiguous(jid: str, claimants: int, _unreachable: int) -> None:
+        global owner_conflicts
+        owner_conflicts += 1
+        _publish("owner_ambiguous", job_id=jid, claimants=claimants)
+
+    found = await find_owner(
+        job_id,
+        path,
+        headers,
+        # EVERY attached replica, including ones currently marked unhealthy —
+        # see find_owner on why filtering them breaks the guard's argument.
+        candidates=[st.url for st in list(bal.stats.values())],
+        client=ctl,
+        log=lambda msg: print(msg, flush=True),
+        on_ambiguous=_ambiguous,
+    )
+    if found is None:
+        return None
+    url, status = found
+    bal.remember(job_id, url)
+    if status not in TERMINAL_STATUSES:
+        bal.begin_job(job_id, url)
+    return url
 
 
 async def _safe_pump() -> None:
@@ -211,6 +378,13 @@ async def _safe_pump() -> None:
     import asyncio
 
     task = asyncio.ensure_future(_pump())
+    # A STRONG reference for the task's whole life. The event loop keeps
+    # only a weak one, so a pump suspended inside its submission POST — a
+    # ticket already claimed, a slot already reserved — could be garbage
+    # collected the moment this frame returned on the cancelled path,
+    # freezing that ticket in SUBMITTING and leaking the slot forever.
+    _pending_pumps.add(task)
+    task.add_done_callback(_pending_pumps.discard)
     with contextlib.suppress(asyncio.CancelledError):
         await asyncio.shield(task)
 
@@ -224,7 +398,7 @@ async def job_events(job_id: str, request: Request) -> Response:
     This emits queue position while waiting behind other work, then liveness
     and an ETA once running, then a terminal event.
     """
-    headers = _auth(request)
+    headers = auth_headers(request, API_KEY)
 
     async def stream():
         import asyncio
@@ -282,11 +456,17 @@ async def job_events(job_id: str, request: Request) -> Response:
                 position = admission.position(ticket_id)
                 means = [s.mean_job_s for s in bal.stats.values() if s.mean_job_s]
                 mean = sum(means) / len(means) if means else 0.0
-                wait = admission.wait_estimate_s(ticket_id, mean, len(bal.stats) or 1)
+                # Divided by replicas that can actually DRAIN the queue, not by
+                # everything attached: a fleet with dead replicas that once
+                # completed work still has a mean, so the old divisor produced
+                # a confident finite ETA that could never come true.
+                accepting = bal.capacity()["accepting_replicas"]
+                wait = admission.wait_estimate_s(ticket_id, mean, accepting or 1)
                 event = {
                     "job_id": ticket_id,
                     "status": "queued",
                     "queue_position": position,
+                    "accepting_replicas": accepting,
                     "eta_s": round(wait) if wait is not None else None,
                     "billable": False,
                 }
@@ -299,15 +479,25 @@ async def job_events(job_id: str, request: Request) -> Response:
                 await _safe_pump()
                 continue
 
-            target = bal.owner(current) or await _find_owner(
-                current, f"/v1/videos/{current}", headers
-            )
+            try:
+                target = bal.owner(current) or await _find_owner(
+                    current, f"/v1/videos/{current}", headers
+                )
+            except AmbiguousOwner:
+                # Say so on the stream too: a watcher must not read this as
+                # "gone" and resubmit.
+                yield _sse({"status": "ambiguous", "job_id": current, "retryable": False})
+                return
             if target is None:
                 yield _sse({"status": "unknown", "job_id": current})
                 return
             status = "queued"
             with contextlib.suppress(httpx.HTTPError, ValueError):
-                r = await client.get(f"{target}/v1/videos/{current}", headers=headers)
+                # ctl, not client: this is a status poll, and `client` has
+                # read=None. A wedged replica blocked every SSE watcher
+                # here forever — never reaching the disconnect check, so
+                # the coroutine outlived the client that opened it.
+                r = await ctl.get(f"{target}/v1/videos/{current}", headers=headers)
                 status = str(dict(r.json()).get("status") or "queued")
             ahead = bal.queue_position(current)
             eta = bal.eta_hint_s(current)
@@ -324,8 +514,10 @@ async def job_events(job_id: str, request: Request) -> Response:
                 # `current`, not the id we were subscribed with: after a ticket
                 # hands over, the occupancy is held against the JOB id, and
                 # ending the ticket id instead leaks the replica slot forever.
-                bal.end_job(current, ok=status == "completed")
-                _note_terminal(current, str(status), closed_by="client-sse")
+                # Note only on a REAL close: whoever closes first owns the
+                # recent-ring entry (see Balancer.end_job).
+                if bal.end_job(current, ok=status == "completed"):
+                    _note_terminal(current, str(status), closed_by="client-sse")
                 return
             if await request.is_disconnected():
                 return
@@ -344,8 +536,18 @@ POLL_S = 5.0
 
 
 def _all_busy() -> bool:
-    live = [s for s in bal.stats.values() if s.accepting]
-    return bool(live) and all(s.inflight > 0 for s in live)
+    """Is there NO free slot right now — including "no slots at all"?
+
+    `bool(live) and ...` made a fully drained or fully unhealthy fleet
+    report NOT busy, so admission waved every submission straight through
+    to `pick()`, which had nothing to give, and the caller got a 503
+    instead of a ticket. During a `fleet switch` — the exact window the
+    queue exists to cover — the queue could never even bootstrap, because
+    the "someone is already waiting" path needs a first ticket to exist.
+    Delegates to free_slots() so the queue and the capacity endpoint can
+    never disagree about what "free" means.
+    """
+    return bal.free_slots() == 0
 
 
 def _retry_hint() -> int:
@@ -375,7 +577,7 @@ async def _admit(path: str, request: Request, headers: dict, body: bytes):
     where it could no longer be cancelled, reprioritised or counted.
     """
     # LATENT GAP — other modalities bypass the queue entirely.
-    # Only "/v1/videos" is held. _COLLECTIONS already names videos, images and
+    # Only "/v1/videos" is held. COLLECTIONS already names videos, images and
     # meshes, and the moment an image or mesh model is deployed its requests
     # will be submitted on arrival: no ticket, no position, no cancellation,
     # and no billing line. Harmless while video is the only deployment.
@@ -410,7 +612,18 @@ async def _admit(path: str, request: Request, headers: dict, body: bytes):
     payload: dict = {}
     with contextlib.suppress(ValueError, TypeError):
         payload = json.loads(body) if body else {}
-    priority = int(payload.get("priority", PRIORITY_NORMAL))
+    # A client's junk must not become a 500. `{"priority": "high"}` raised
+    # ValueError straight out of the handler; an unparseable priority is a
+    # request the caller can fix, so it takes the documented default.
+    priority = PRIORITY_NORMAL
+    with contextlib.suppress(ValueError, TypeError):
+        # CLAMPED to the documented scale. Unbounded, any caller sending
+        # `priority: -1000` sorted ahead of everything forever — including
+        # the service layer's own PRIORITY_HIGH — and the queue has no
+        # ageing, so one such client starves it indefinitely.
+        priority = min(
+            max(int(payload.get("priority", PRIORITY_NORMAL)), PRIORITY_HIGH), PRIORITY_LOW
+        )
     ticket = admission.enqueue(
         {"path": path, "body": payload, "headers": dict(headers)},
         priority=priority,
@@ -431,7 +644,9 @@ async def _admit(path: str, request: Request, headers: dict, body: bytes):
     position = admission.position(ticket.ticket_id)
     means = [s.mean_job_s for s in bal.stats.values() if s.mean_job_s]
     mean = sum(means) / len(means) if means else 0.0
-    wait = admission.wait_estimate_s(ticket.ticket_id, mean, len(bal.stats) or 1)
+    wait = admission.wait_estimate_s(
+        ticket.ticket_id, mean, bal.capacity()["accepting_replicas"] or 1
+    )
     # Shaped like a job so a client polls one way regardless of which side of
     # the billing line the request is currently on.
     return JSONResponse(
@@ -480,13 +695,35 @@ async def _pump() -> None:
                 headers=ticket.body.get("headers") or {},
                 json=ticket.body.get("body") or {},
             )
-        except httpx.HTTPError:
+        except (httpx.ConnectError, httpx.ConnectTimeout):
             bal.release(target, failed=True)
             bal.mark(target, healthy=False)
-            # Transport error: the request never reached the replica, so the
-            # ticket goes back to the queue for a different one.
+            _publish("fleet", action="unhealthy", url=target)
+            # CONNECT-phase failure: the request provably never reached the
+            # replica, so the ticket safely goes back to the queue.
+            global submit_requeued
+            submit_requeued += 1
             admission.release_claim(ticket.ticket_id)
             return
+        except httpx.HTTPError as exc:
+            # AMBIGUOUS transport failure (read timeout, broken pipe): the
+            # engine may have ACCEPTED and queued the job with only the
+            # response lost. Requeuing here generated the same prompt twice
+            # — a ghost with no occupancy, no owner, no meta (replica-0's
+            # failed=41 was this, one ghost per timeout). The only honest
+            # move is a LOUD terminal refusal: the caller decides whether
+            # to resubmit, knowing a duplicate is possible.
+            bal.release(target, failed=True)
+            detail = (
+                f"submission outcome unknown ({type(exc).__name__} against "
+                f"{target}) — not retried: the engine may already hold this "
+                f"job, and a blind retry can generate it twice"
+            )
+            global submit_ambiguous
+            submit_ambiguous += 1
+            admission.mark_rejected(ticket.ticket_id, detail)
+            _publish("rejected", ticket=ticket.ticket_id, error=detail[:120])
+            continue
         except BaseException:
             # Cancellation (or anything else non-HTTP) mid-POST: put back
             # BOTH pieces of held state, or the ticket freezes in SUBMITTING
@@ -503,6 +740,8 @@ async def _pump() -> None:
             # To add one: retry only 5xx, only on a replica not yet tried,
             # bounded — needs attempts/tried fields on Ticket.
             detail = resp.text[:300] if resp.content else f"HTTP {resp.status_code}"
+            global submit_rejected
+            submit_rejected += 1
             admission.mark_rejected(ticket.ticket_id, detail)
             _publish("rejected", ticket=ticket.ticket_id, error=detail[:120])
             continue
@@ -511,16 +750,22 @@ async def _pump() -> None:
             payload = json.loads(resp.content)
             job_id = str(payload.get("id") or "")
             status = str(payload.get("status") or "")
+        # FIRST, before any side effect. Everything below can raise, and
+        # this is the only call that moves the ticket out of SUBMITTING —
+        # which `prune` spares and `cancel` refuses. A failure after
+        # `begin_job` froze the ticket there permanently: the customer
+        # polled "queued" forever while being billed for a job that ran to
+        # completion, and nothing could ever settle it.
+        admission.mark_submitted(ticket.ticket_id, job_id, target)
         if job_id and status not in TERMINAL_STATUSES:
             # Same rule as the direct path: the slot becomes the job's.
             bal.release(target)
-            bal.begin_job(job_id, target, collection=_collection_of(path))
-            _capture_meta(job_id, ticket.body.get("body") or {}, via="queue")
+            bal.begin_job(job_id, target, collection=collection_of(path))
+            _capture_meta(job_id, ticket.body.get("body") or {}, via="queue", backend=target)
             _publish("handover", ticket=ticket.ticket_id, job_id=job_id, backend=target)
         else:
             # Finished inside the call — a real, short job, counted as one.
             bal.record_inline(target, began, ok=True)
-        admission.mark_submitted(ticket.ticket_id, job_id, target)
 
 
 @app.get("/v1/queue")
@@ -530,12 +775,8 @@ async def queue_state() -> JSONResponse:
         {
             **admission.snapshot(),
             "next": [
-                {
-                    "ticket": t.ticket_id,
-                    "priority": t.priority,
-                    "position": admission.position(t.ticket_id),
-                }
-                for t in admission.waiting()[:20]
+                {"ticket": t.ticket_id, "priority": t.priority, "position": position}
+                for position, t in enumerate(admission.waiting()[:20])
             ],
         }
     )
@@ -579,9 +820,17 @@ _job_strikes: dict[str, int] = {}
 def _strike(job_id: str, url: str, why: str) -> None:
     _job_strikes[job_id] = _job_strikes.get(job_id, 0) + 1
     if _job_strikes[job_id] >= JOB_LOST_STRIKES:
-        bal.end_job(job_id, ok=False)
-        _note_terminal(job_id, "lost", closed_by="strikes")
-        bal.reaped += 1
+        # Counted ONLY on a real close. `reaped` is the number a billing
+        # layer watches for walked-away work, and sitting outside this
+        # guard it was incremented once per concurrent reconcile pass over
+        # the same job.
+        if bal.end_job(job_id, ok=False):
+            # "failed", not "lost": the wire vocabulary is the documented
+            # four, and a consumer switching on it silently ignored every
+            # strike-closed job. The nuance lives in closed_by/reason,
+            # which are fields, not a fifth status.
+            _note_terminal(job_id, "failed", closed_by="strikes", reason=why)
+            bal.reaped += 1
         _job_strikes.pop(job_id, None)
         print(
             f"presumed lost after {JOB_LOST_STRIKES} probes: {job_id} on "
@@ -600,39 +849,73 @@ async def _reap_stale_jobs() -> None:
     finished slots and drains its queue: no external request is ever
     required for the platform to make progress on admitted work.
     """
+    import asyncio
     import time as _time
 
     now = _time.monotonic()
     auth = {"authorization": f"Bearer {API_KEY}"} if API_KEY else {}
-    for job_id, url, began, collection in bal.open_jobs():
-        if now - began < RECONCILE_MIN_AGE_S:
-            continue
+    due = [j for j in bal.open_jobs() if now - j[2] >= RECONCILE_MIN_AGE_S]
+
+    async def _probe(job_id: str, url: str, collection: str) -> None:
         try:
             r = await ctl.get(f"{url}/v1/{collection}/{job_id}", headers=auth)
         except httpx.HTTPError:
             _strike(job_id, url, "replica unreachable")
-            continue
+            return
         if r.status_code == 404:
             _strike(job_id, url, "unknown to its replica")
-            continue
+            return
         if r.status_code >= 400:
-            continue
+            return
         status = ""
         with contextlib.suppress(ValueError, TypeError, KeyError):
             status = str(dict(r.json()).get("status") or "")
-        if status in TERMINAL_STATUSES:
-            bal.end_job(job_id, ok=status == "completed")
+        if status in TERMINAL_STATUSES and bal.end_job(job_id, ok=status == "completed"):
+            # Everything below is guarded by end_job's dedupe: it is the
+            # single winner across concurrent reconcile passes. `reaped`
+            # sat outside it and was incremented once per pass, inflating
+            # the counter a billing layer watches for walked-away work.
             _note_terminal(job_id, status, closed_by="reconciler")
-            _job_strikes.pop(job_id, None)
-            # Closed by the platform, not by a client poll — the counter
-            # a billing layer watches for walked-away work.
             bal.reaped += 1
             print(
-                f"reconciled {job_id} ({status}) on {url}: closed without a client poll", flush=True
+                f"reconciled {job_id} ({status}) on {url}: closed without a client poll",
+                flush=True,
             )
-        else:
-            # Alive and known: a healthy answer clears past strikes.
-            _job_strikes.pop(job_id, None)
+        _job_strikes.pop(job_id, None)
+
+    # CONCURRENTLY. Sequentially, each probe could take the full control
+    # timeout, so one wedged replica turned a 10-second beat into minutes —
+    # making JOB_LOST_STRIKES mean "5 x however long the beat took" and
+    # stalling reconcile, revive, pump and prune together on the slowest
+    # replica. That is exactly what CTL_TIMEOUT's docstring says must not
+    # happen.
+    await asyncio.gather(*(_probe(j, u, c) for j, u, _t, c in due))
+
+    # Strikes belong to OPEN jobs only. Entries were removed on threshold or
+    # on a healthy answer, so a job closed by any other path (client poll,
+    # SSE, DELETE) left its counter behind forever — an unbounded dict on a
+    # long-lived balancer, and stale strikes re-applied to a recycled id.
+    live = {j for j, _u, _t, _c in bal.open_jobs()}
+    for gone in [j for j in _job_strikes if j not in live]:
+        _job_strikes.pop(gone, None)
+
+    # A replica that keeps ANSWERING for work it will never finish is
+    # invisible to everything above: closure is terminal-only, and strikes
+    # fire only on 404/unreachable. The client gives up at its own floor
+    # and fails the item, while the slot stays occupied forever — a
+    # permanent capacity loss per wedge. This rule existed as dead code in
+    # balance.py the whole time.
+    for job_id, url in bal.stale_jobs():
+        if not bal.end_job(job_id, ok=False):
+            continue
+        _note_terminal(
+            job_id, "failed", closed_by="stale", reason="exceeded this fleet's overrun limit"
+        )
+        bal.reaped += 1
+        print(f"stale: {job_id} on {url} exceeded the overrun limit — slot released", flush=True)
+        # Tell the replica too, so it stops spending on work nobody awaits.
+        with contextlib.suppress(httpx.HTTPError):
+            await ctl.delete(f"{url}/v1/videos/{job_id}", headers=auth)
 
 
 async def _revive_backends() -> None:
@@ -661,28 +944,59 @@ async def _revive_backends() -> None:
 # drops oldest and receives a `gap` marker, and the bounded replay ring lets
 # a reconnecting subscriber catch up with `?since=<seq>`.
 
+# Identifies THIS process lifetime in every event and in the audit log.
+BOOT_ID = os.urandom(4).hex()
+
 EVENTS_RING_MAX = 500
-_events_ring: list[dict] = []
-
-
-def _seq_counter():
-    n = 0
-    while True:
-        n += 1
-        yield n
-
-
-_event_seq = _seq_counter()
+# deque(maxlen=...) IS a ring: the hand-rolled list + `del ring[:-500]` did
+# an O(n) slice-delete on every published event, and the same hand-rolled
+# shape appeared again for `_recent` with `insert(0, ...)`, which is O(n)
+# too. itertools.count is the sequence generator, already used in the two
+# sibling modules.
+_events_ring: deque[dict] = deque(maxlen=EVENTS_RING_MAX)
+_event_seq = itertools.count(1)
 _subscribers: set = set()
+
+
+# Persistent audit trail: the SAME events the firehose streams, appended to
+# disk. The ring answers "what just happened"; this answers "what happened
+# last Tuesday" — the question every duplicate/misattribution incident asks
+# and the 500-event ring could not. JSONL, append-only, rotated once at
+# _AUDIT_MAX_BYTES (current + .1 = bounded at ~2x).
+AUDIT_LOG = os.environ.get(
+    "DEEPME_AUDIT_LOG", str(Path(WORK_DIR) / "audit.jsonl") if WORK_DIR else ""
+)
+_AUDIT_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _audit_write(evt: dict) -> None:
+    if not AUDIT_LOG:
+        return
+    with contextlib.suppress(OSError):
+        path = Path(AUDIT_LOG)
+        if path.exists() and path.stat().st_size > _AUDIT_MAX_BYTES:
+            path.replace(f"{AUDIT_LOG}.1")
+        with path.open("a") as f:
+            f.write(json.dumps(evt) + "\n")
 
 
 def _publish(kind: str, **fields) -> None:
     import asyncio
     import time as _time
 
-    evt = {"seq": next(_event_seq), "ts": round(_time.time(), 3), "type": kind, **fields}
+    # `boot` partitions the log. `seq` restarts at 1 on every process start,
+    # so across a restart — the event that destroys waiting tickets and
+    # re-mints ticket ids — sequence numbers COLLIDE, and a reconstruction
+    # cannot order or separate the two lifetimes.
+    evt = {
+        "seq": next(_event_seq),
+        "boot": BOOT_ID,
+        "ts": round(_time.time(), 3),
+        "type": kind,
+        **fields,
+    }
+    _audit_write(evt)
     _events_ring.append(evt)
-    del _events_ring[:-EVENTS_RING_MAX]
     for q in list(_subscribers):
         try:
             q.put_nowait(evt)
@@ -698,38 +1012,57 @@ def _publish(kind: str, **fields) -> None:
 # jobs run but never WHAT they are.
 _job_meta: dict[str, dict] = {}
 # Last N terminal jobs, newest first — the operator's "what just happened".
-_recent: list[dict] = []
 _RECENT_MAX = 50
+_recent: deque[dict] = deque(maxlen=_RECENT_MAX)
 
 
-def _capture_meta(job_id: str, payload: dict, *, via: str) -> None:
+def _capture_meta(job_id: str, payload: dict, *, via: str, backend: str = "") -> None:
     if not job_id or not isinstance(payload, dict):
         return
+    import hashlib
+
     target = payload.get("target") or {}
+    prompt = str(payload.get("prompt") or "")
     _job_meta[job_id] = {
         "task": payload.get("task"),
-        "prompt": str(payload.get("prompt") or "")[:120],
+        "prompt": prompt[:120],
+        # The two fields a duplicate incident turns on. Two items with the
+        # same 120-char prompt prefix and DIFFERENT seeds were
+        # indistinguishable in the audit log — which is exactly the
+        # question `batch dedupe` exists to answer after the fact.
+        "seed": payload.get("seed"),
+        "prompt_sha": hashlib.sha1(prompt.encode()).hexdigest()[:12],
         "seconds": target.get("duration_seconds") or payload.get("seconds"),
         "priority": payload.get("priority"),
         "via": via,
+        # WHERE it runs, recorded at start. Previously the job->replica
+        # binding first appeared at `terminal`, so a job that never closed
+        # cleanly had no recorded owner at all.
+        "backend": backend or bal.owner(job_id) or "",
     }
     while len(_job_meta) > 2000:
         _job_meta.pop(next(iter(_job_meta)))
     _publish("started", job_id=job_id, **_job_meta[job_id])
 
 
-def _note_terminal(job_id: str, status: str, *, closed_by: str) -> None:
+def _note_terminal(job_id: str, status: str, *, closed_by: str, reason: str = "") -> None:
     import time as _time
 
     entry = {
         "job_id": job_id,
         "status": status,
         "closed_by": closed_by,
+        # WHY, when the closer knows: a strike's "404 vs unreachable" is the
+        # whole diagnosis and it used to live only in the journal.
+        **({"reason": reason} if reason else {}),
+        # WHERE it ran — "failed (strikes) @8100" is a diagnosis, "failed"
+        # alone is a mystery. The owner map outlives occupancy, so this is
+        # still known at close time.
+        "backend": bal.owner(job_id),
         "finished_at": _time.time(),
         **_job_meta.pop(job_id, {}),
     }
-    _recent.insert(0, entry)
-    del _recent[_RECENT_MAX:]
+    _recent.appendleft(entry)
     _publish("terminal", **{k: v for k, v in entry.items() if k != "finished_at"})
 
 
@@ -765,33 +1098,116 @@ def _retention_candidates(
     return out
 
 
-def _retention_pass() -> None:
-    """Reclaim expired artifacts, on the platform's clock."""
+def _artifact_id(path) -> str:
+    """The job id a file belongs to, from its name or its directory.
+
+    Engines write `{id}.mp4`, `{id}.0.mp4`-style multi-outputs, and
+    per-job subdirectories. Matching `p.stem` exactly missed everything
+    but the first form, so fetched/open lookups silently degraded to the
+    6h mtime window.
+    """
+    # A per-job SUBDIRECTORY names the job; the file inside it usually does
+    # not (`outputs/<job_id>/output.mp4`). Taking the stem unconditionally
+    # gave every such job the artifact id "output", so no job's id ever
+    # matched the open set — running work was not protected from deletion —
+    # and the first fetch of ANY job collapsed every other job's 6h window
+    # to 1h. Prefer the directory whenever the file is nested.
+    outputs = Path(WORK_DIR) / "outputs" if WORK_DIR else None
+    if outputs is not None and path.parent != outputs and path.parent.name:
+        return path.parent.name
+    return path.stem.partition(".")[0] or path.parent.name
+
+
+def _scan_dir(root, *, with_ids: bool) -> list[tuple[str, str, float]]:
+    """(path, artifact id, mtime) for every file under `root`.
+
+    A file that vanishes mid-walk drops out; it never aborts the scan.
+    """
+    out: list[tuple[str, str, float]] = []
+    try:
+        walk = list(root.rglob("*"))
+    except OSError:
+        return out
+    for p in walk:
+        with contextlib.suppress(OSError):
+            if p.is_file():
+                out.append((str(p), _artifact_id(p) if with_ids else "", p.stat().st_mtime))
+    return out
+
+
+def _delete_artifacts(job_id: str) -> int:
+    """Remove every file belonging to a job. Returns how many went.
+
+    Called the instant a download completes: an artifact that has been
+    delivered has no remaining purpose, and keeping it is what allows a
+    later request to be served someone else's video.
+    """
+    if not (WORK_DIR and job_id):
+        return 0
+    outputs = Path(WORK_DIR) / "outputs"
+    gone = 0
+    for path, art_id, _mtime in _scan_dir(outputs, with_ids=True):
+        if art_id != job_id:
+            continue
+        with contextlib.suppress(OSError):
+            Path(path).unlink()
+            gone += 1
+            print(f"delivered and reclaimed: {path}", flush=True)
+    # A now-empty per-job directory goes too, or the tree grows forever.
+    with contextlib.suppress(OSError):
+        job_dir = outputs / job_id
+        if job_dir.is_dir() and not any(job_dir.iterdir()):
+            job_dir.rmdir()
+    return gone
+
+
+def _retention_plan() -> list[str]:
+    """Which files are expired. PURE and thread-safe: reads the filesystem
+    and a snapshot of shared state, mutates nothing, publishes nothing.
+
+    The scan is the slow part (a full recursive walk with a stat per file),
+    so it belongs off the event loop — but everything it used to do
+    afterwards did not. `_publish` appends to a deque the SSE replay reader
+    iterates and calls `Queue.put_nowait`, which is not thread-safe: from a
+    worker thread it can wake a loop waiter incorrectly, and an append that
+    evicts under `maxlen` raises `deque mutated during iteration` in any
+    dashboard reconnecting with `?since=`. So: plan here, apply on the loop.
+    """
     import pathlib
     import time as _time
 
-    global retention_deleted
     if not WORK_DIR:
-        return
+        return []
     entries: list[tuple[str, str, float]] = []
     outputs = pathlib.Path(WORK_DIR) / "outputs"
     inputs = pathlib.Path(WORK_DIR) / "inputs"
-    with contextlib.suppress(OSError):
-        entries.extend(
-            (str(p), p.stem, p.stat().st_mtime) for p in outputs.iterdir() if p.is_file()
-        )
-    with contextlib.suppress(OSError):
-        # Staged uploads have no artifact id: global TTL only.
-        entries.extend((str(p), "", p.stat().st_mtime) for p in inputs.iterdir() if p.is_file())
+    # RECURSIVE: engines nest outputs in per-replica/per-job subdirs, and a
+    # flat iterdir() skipped directories entirely — the 6h/1h policy ran
+    # against a directory level nothing wrote to, which is how fetched
+    # files survived for days.
+    #
+    # Suppression is PER FILE, deliberately. Wrapping the whole walk meant
+    # one vanishing file (routine: an engine writes and moves it while the
+    # scan runs) abandoned the entire traversal, so a recurring race
+    # silently disabled retention altogether while /balancer/stats kept
+    # reporting it enabled.
+    entries.extend(_scan_dir(outputs, with_ids=True))
+    entries.extend(_scan_dir(inputs, with_ids=False))
     open_ids = {j for j, _u, _t, _c in bal.open_jobs()}
-    doomed = _retention_candidates(
+    return _retention_candidates(
         entries,
-        _fetched,
+        dict(_fetched),  # a SNAPSHOT: the loop may be mutating the original
         open_ids,
         _time.time(),
         RETENTION_TTL_S,
         RETENTION_FETCHED_TTL_S,
     )
+
+
+def _retention_apply(doomed: list[str]) -> None:
+    """Delete the planned files and record it. LOOP-SIDE ONLY — it
+    publishes events and mutates `_fetched`."""
+    global retention_deleted
     reclaimed = 0
     for path in doomed:
         with contextlib.suppress(OSError):
@@ -800,16 +1216,39 @@ def _retention_pass() -> None:
             reclaimed += 1
             print(f"retention: reclaimed {path}", flush=True)
     if reclaimed:
-        _publish("retention", reclaimed=reclaimed)
-    # Fetch records for deleted artifacts have done their job.
-    kept = {p.rsplit("/", 1)[-1].rsplit(".", 1)[0] for p in doomed}
-    for art_id in list(_fetched):
-        if art_id in kept:
-            _fetched.pop(art_id, None)
+        _publish("retention", reclaimed=reclaimed, paths=doomed[:50])
+    # Fetch records for deleted artifacts have done their job — pruned via
+    # the SAME id extraction the scan used, or records leak forever.
+    kept = {_artifact_id(Path(p)) for p in doomed}
+    dropped = [a for a in _fetched if a in kept]
+    for art_id in dropped:
+        _fetched.pop(art_id, None)
+    if reclaimed or dropped:
+        with contextlib.suppress(OSError):
+            _persist_membership()
 
 
-async def _recover_occupancy() -> None:
-    """Rebuild occupancy from replica truth at boot.
+def _retention_pass() -> None:
+    """Plan and apply in one call — for tests and any synchronous caller."""
+    _retention_apply(_retention_plan())
+
+
+async def _recover_occupancy(*, boot: bool = True) -> int:
+    """Rebuild occupancy from replica truth. Returns the number adopted.
+
+    Runs at boot AND on a slow beat (see _ORPHAN_SWEEP_EVERY_BEATS). The
+    periodic pass is what closes the ghost job: a generation the engine
+    ACCEPTED but we never recorded, because our POST timed out at 60s while
+    the engine kept going, or because an ambiguous submit was rejected after
+    the work had already started. Those jobs occupy a GPU that pick() still
+    believes is free, so the replica gets double-booked and the second job
+    queues inside the engine where nothing can cancel or reorder it. Only
+    boot recovery ever looked for them, so a ghost born at 03:00 stayed a
+    ghost until the next restart.
+
+    Adoption is safe to repeat: begin_job on an id we already hold is a
+    no-op rebinding to the same replica, and TERMINAL ids are never bound
+    (see the note below) so a replica's history cannot resurrect anything.
 
     A restart empties the job map while the replicas keep generating. Left
     unrecovered, pick() double-books busy replicas and _all_busy() reads
@@ -820,18 +1259,63 @@ async def _recover_occupancy() -> None:
     Listing is /v1/videos only — the sole modality deployed; extend per
     collection when another ships (see the _admit latent-gap note).
     """
+    import asyncio
+
     auth = {"authorization": f"Bearer {API_KEY}"} if API_KEY else {}
-    for st in list(bal.stats.values()):
+    known = {j for j, _u, _t, _c in bal.open_jobs()}
+    adopted = 0
+
+    async def _one(st) -> None:
+        nonlocal adopted
         with contextlib.suppress(httpx.HTTPError, ValueError, TypeError, KeyError):
-            r = await ctl.get(f"{st.url}/v1/videos", headers=auth)
+            r = await ctl.get(f"{st.url}/v1/videos", headers=auth, timeout=RECOVERY_TIMEOUT)
             if r.status_code >= 400:
-                continue
+                return
             for job in dict(r.json()).get("data", []) or []:
                 job_id = str(job.get("id") or "")
                 status = str(job.get("status") or "")
-                if job_id and status not in TERMINAL_STATUSES:
+                if not job_id:
+                    continue
+                if status not in TERMINAL_STATUSES:
+                    if job_id in known:
+                        continue  # already accounted for; nothing to adopt
                     bal.begin_job(job_id, st.url)
-                    print(f"recovered occupancy: {job_id} running on {st.url}", flush=True)
+                    adopted += 1
+                    if boot:
+                        print(f"recovered occupancy: {job_id} running on {st.url}", flush=True)
+                    else:
+                        # NOT routine. A ghost at runtime means a generation
+                        # was burning a GPU that we believed was free, so it
+                        # is worth an event and a counter, not just a log.
+                        global orphans_adopted
+                        orphans_adopted += 1
+                        _publish("job", action="orphan-adopted", job=job_id, url=st.url)
+                        print(
+                            f"adopted orphan {job_id} on {st.url}: running but untracked",
+                            flush=True,
+                        )
+                # TERMINAL ids are deliberately NOT re-bound here. A replica's
+                # /v1/videos is its whole HISTORY, and engine ids are minted
+                # PER REPLICA and re-minted after an engine restart — so
+                # adopting every terminal id from every replica overwrote live
+                # bindings with stale ones whenever two replicas had ever used
+                # the same number. The owner map then pointed at the replica
+                # holding the OLD artifact, /content streamed it, and the
+                # binding was persisted and taught to the gateway. A
+                # completed-but-unfetched job is resolved correctly by the
+                # VERIFIED probe instead, which requires the body to name the
+                # id.
+
+    # CONCURRENTLY and on a SHORT timeout. This runs before the lifespan
+    # yields, so uvicorn does not bind the port until it returns: probing
+    # replicas one at a time at the 30s control timeout meant a fleet of
+    # slow-answering replicas held the balancer in connection-refused for
+    # minutes, which is how a restart turned into an outage. Recovery is
+    # best-effort — the maintenance beat reconciles anything missed within
+    # one beat — so a replica that cannot answer FAST is skipped, not
+    # waited on.
+    await asyncio.gather(*(_one(st) for st in list(bal.stats.values())))
+    return adopted
 
 
 @app.get("/v1/capacity")
@@ -893,6 +1377,10 @@ def _persist_membership() -> None:
         # First-fetch times survive too, or a restart would silently reset
         # every artifact's 1h re-fetch window back to the 6h global one.
         "fetched": dict(_fetched),
+        # Job ownership survives: a restart that forgot who owns what sent
+        # every stranded poll through the owner probe — the misattribution
+        # path this file now closes at the source.
+        "owners": bal.owners_snapshot(),
     }
     tmp = pathlib.Path(f"{MEMBERSHIP_FILE}.tmp")
     tmp.write_text(json.dumps(state))
@@ -925,12 +1413,15 @@ def _restore_membership() -> None:
             bal.drain(str(url))
         if not isinstance(state, list):
             _fetched.update({str(k): float(v) for k, v in (state.get("fetched") or {}).items()})
+            for job_id, url in (state.get("owners") or {}).items():
+                if str(url) in bal.stats:
+                    bal.remember(str(job_id), str(url))
 
 
 _restore_membership()
 
 
-@app.post("/balancer/backends")
+@app.post("/balancer/backends", dependencies=[Depends(require_key)])
 async def attach_backend(request: Request) -> JSONResponse:
     """Attach a replica at runtime — probed first, so a typo cannot join.
 
@@ -960,7 +1451,7 @@ async def attach_backend(request: Request) -> JSONResponse:
     )
 
 
-@app.post("/balancer/backends/drain")
+@app.post("/balancer/backends/drain", dependencies=[Depends(require_key)])
 async def drain_backend(request: Request) -> JSONResponse:
     """Take a replica out of rotation without touching its running work.
 
@@ -974,11 +1465,12 @@ async def drain_backend(request: Request) -> JSONResponse:
     if not bal.drain(url):
         return JSONResponse({"detail": f"{url} is not attached"}, status_code=404)
     _persist_membership()  # a restart must not put it back in rotation
+    _publish("fleet", action="drained", url=url)
     st = bal.stats[url]
     return JSONResponse({"url": url, "draining": True, "inflight": st.inflight})
 
 
-@app.post("/balancer/backends/undrain")
+@app.post("/balancer/backends/undrain", dependencies=[Depends(require_key)])
 async def undrain_backend(request: Request) -> JSONResponse:
     """Put a drained replica back in rotation.
 
@@ -993,11 +1485,12 @@ async def undrain_backend(request: Request) -> JSONResponse:
     if not bal.undrain(url):
         return JSONResponse({"detail": f"{url} is not attached"}, status_code=404)
     _persist_membership()
+    _publish("fleet", action="undrained", url=url)
     await _safe_pump()  # a slot just came back
     return JSONResponse({"url": url, "draining": False})
 
 
-@app.delete("/balancer/backends")
+@app.delete("/balancer/backends", dependencies=[Depends(require_key)])
 async def detach_backend(request: Request) -> JSONResponse:
     url = str(request.query_params.get("url") or "").rstrip("/")
     ok, why = bal.detach(url)
@@ -1009,6 +1502,7 @@ async def detach_backend(request: Request) -> JSONResponse:
             status_code=404 if why == "not attached" else 409,
         )
     _persist_membership()
+    _publish("fleet", action="detached", url=url)
     return JSONResponse({"url": url, "detached": True, "backends": bal.backend_urls()})
 
 
@@ -1068,13 +1562,18 @@ async def jobs() -> JSONResponse:
     """
     running = [{**j, **_job_meta.get(j["job_id"], {})} for j in bal.running_jobs()]
     queued = []
-    for t in admission.waiting():
+    # ONE sorted pass, enumerated. Asking `position()` per ticket re-sorted
+    # the entire queue each time — O(n^2 log n) with no await anywhere in
+    # the loop, so at the 5000-ticket prune bound a single dashboard poll
+    # pinned the event loop for seconds: heartbeats stopped, /health timed
+    # out, and the gateway marked a perfectly healthy fleet down.
+    for position, t in enumerate(admission.waiting()):
         body = t.body.get("body") or {}
         target = body.get("target") or {}
         queued.append(
             {
                 "ticket": t.ticket_id,
-                "position": admission.position(t.ticket_id),
+                "position": position,
                 "priority": t.priority,
                 "task": body.get("task"),
                 "prompt": str(body.get("prompt") or "")[:120],
@@ -1108,7 +1607,44 @@ async def metrics() -> Response:
         f"deepme_jobs_reaped_total {bal.reaped}",
         "# TYPE deepme_retention_deleted_total counter",
         f"deepme_retention_deleted_total {retention_deleted}",
+        # A dead maintenance loop looks exactly like a healthy idle one from
+        # the outside — unless it is counted.
+        "# TYPE deepme_maintenance_errors_total counter",
+        f"deepme_maintenance_errors_total {maintenance_errors}",
+        "# TYPE deepme_retention_errors_total counter",
+        f"deepme_retention_errors_total {retention_errors}",
+        # Submission outcomes BY CAUSE — "submissions are failing" and
+        # "which cause" were previously the same unanswerable question.
+        "# TYPE deepme_submit_rejected_total counter",
+        f"deepme_submit_rejected_total {submit_rejected}",
+        "# TYPE deepme_submit_ambiguous_total counter",
+        f"deepme_submit_ambiguous_total {submit_ambiguous}",
+        "# TYPE deepme_submit_requeued_total counter",
+        f"deepme_submit_requeued_total {submit_requeued}",
+        # Identity integrity: both of these firing means the platform caught
+        # itself about to serve the wrong job.
+        "# TYPE deepme_owner_conflicts_total counter",
+        f"deepme_owner_conflicts_total {owner_conflicts}",
+        "# TYPE deepme_owner_rejections_total counter",
+        f"deepme_owner_rejections_total {owner_rejections}",
+        "# HELP deepme_orphans_adopted_total Running jobs found untracked by the sweep.",
+        "# TYPE deepme_orphans_adopted_total counter",
+        f"deepme_orphans_adopted_total {orphans_adopted}",
+        "# HELP deepme_submit_unservable_total Waiting tickets refused: fleet could never serve them.",
+        "# TYPE deepme_submit_unservable_total counter",
+        f"deepme_submit_unservable_total {submit_unservable}",
+        "# TYPE deepme_queue_tickets gauge",
+        f"deepme_queue_tickets {admission.snapshot()['tickets']}",
     ]
+    # PER REPLICA, so a single degrading replica is alertable — these exist
+    # in /balancer/stats but never reached a scrape target.
+    for b in bal.snapshot()["backends"]:
+        label = f'{{replica="{b["url"]}"}}'
+        lines += [
+            f"deepme_replica_completed_total{label} {b['completed']}",
+            f"deepme_replica_failed_total{label} {b['failed']}",
+            f"deepme_replica_inflight{label} {b['inflight']}",
+        ]
     if cap.get("mean_job_s"):
         lines += [
             "# TYPE deepme_job_mean_seconds gauge",
@@ -1125,7 +1661,7 @@ async def metrics() -> Response:
     return Response("\n".join(lines) + "\n", media_type="text/plain")
 
 
-@app.get("/balancer/stats")
+@app.get("/balancer/stats", dependencies=[Depends(require_key)])
 async def stats() -> JSONResponse:
     # Reap before reporting, so the numbers an operator (or a billing layer)
     # reads are not inflated by clients that walked away.
@@ -1137,6 +1673,18 @@ async def stats() -> JSONResponse:
         "ttl_s": RETENTION_TTL_S,
         "fetched_ttl_s": RETENTION_FETCHED_TTL_S,
         "enabled": bool(WORK_DIR),
+    }
+    # Health of the platform's own machinery, where an OPERATOR will look.
+    # These counters exist because a dead maintenance loop is indis-
+    # tinguishable from a healthy idle one — but they lived only in
+    # /metrics, which no command reads, so in practice nobody could see
+    # them. Same for the queue: the runbook told operators to curl it.
+    snap["queue"] = admission.snapshot()
+    snap["maintenance"] = {
+        "errors_total": maintenance_errors,
+        "retention_errors_total": retention_errors,
+        "audit_enabled": bool(AUDIT_LOG),
+        "boot": BOOT_ID,
     }
     return JSONResponse(snap)
 
@@ -1157,11 +1705,11 @@ async def health() -> JSONResponse:
 @app.api_route("/{path:path}", methods=["GET", "POST", "DELETE"])
 async def proxy(path: str, request: Request) -> Response:
     full = "/" + path
-    headers = _auth(request)
+    headers = auth_headers(request, API_KEY)
     body = await request.body()
 
     # 1. A request about an EXISTING job goes to its owner, wherever it is.
-    job_id = _job_id(full)
+    job_id = job_id_of(full)
 
     # A ticket is not a job yet, but a 202 hands the caller an id shaped like
     # one and invites it to poll. Until a replica takes the work there is
@@ -1171,6 +1719,22 @@ async def proxy(path: str, request: Request) -> Response:
         ticket = admission.get(job_id)
         if ticket is None:
             return JSONResponse({"detail": f"no such ticket {job_id}"}, status_code=404)
+        # A SUB-RESOURCE (/content) on a ticket that has no job yet has no
+        # bytes to serve. This branch used to answer every q_ path with a
+        # JSON status body at 200 — so a client fetching /content early
+        # streamed that JSON into its .mp4, renamed it, and recorded a
+        # successful deliverable. There is no status code a body-shaped
+        # answer is correct for here.
+        if request.method == "GET" and not full.rstrip("/").endswith(job_id) and not ticket.job_id:
+            return JSONResponse(
+                {
+                    "detail": f"{job_id} has not reached a replica yet — "
+                    f"no artifact exists; poll {job_id} until it reports "
+                    f"completed",
+                    "status": "queued",
+                },
+                status_code=409,
+            )
         if request.method == "DELETE":
             ok, why = admission.cancel(job_id)
             return JSONResponse(
@@ -1210,14 +1774,67 @@ async def proxy(path: str, request: Request) -> Response:
                     "object": "video",
                     "status": "cancelled" if ticket.state == CANCELLED else "queued",
                     "queue_position": position,
+                    # THE EVIDENCE A WAITING CLIENT NEEDS. Without this, a poll
+                    # of a ticket on a dead fleet is byte-identical to one that
+                    # is next in line behind a long generation: same 200, same
+                    # "queued", same position. A client cannot distinguish "wait,
+                    # this is working" from "there is no fleet and never will
+                    # be", so it waits forever — and it is right to, because
+                    # queueing is legitimate and killing queued work on a timer
+                    # is what this platform refuses to do. `accepting_replicas:
+                    # 0` alongside a position is unambiguous: nothing can ever
+                    # take this. capacity() is pure in-memory, so this is free.
+                    "accepting_replicas": bal.capacity()["accepting_replicas"],
                     "billable": False,
                 }
             )
         full = full.replace(job_id, ticket.job_id, 1)
         job_id = ticket.job_id
 
+    if job_id and request.method == "DELETE" and is_content(full):
+        # THE ACK. "I have persisted these bytes; you may reclaim them."
+        #
+        # Distinct from DELETE on the job itself, which CANCELS work — acking
+        # a delivered artifact must never be mistaken for cancelling the job
+        # that produced it, so this is handled before any cancel path and is
+        # never forwarded to the replica.
+        #
+        # Idempotent and safe to call for an unknown id: the client may retry
+        # an ack whose response was lost, and a second one must not error.
+        # Deliberately NOT gated on _fetched — an operator or a caller that
+        # already holds the file may reclaim it either way.
+        removed = _delete_artifacts(job_id)
+        if removed:
+            _publish("reclaimed", job_id=job_id, files=removed, reason="acked")
+        return JSONResponse(
+            {"id": job_id, "reclaimed": removed, "object": "video.ack"},
+            status_code=200,
+        )
+
     if job_id and request.method in ("GET", "DELETE"):
-        target = bal.owner(job_id) or await _find_owner(job_id, full, headers)
+        target = bal.owner(job_id)
+        # VERIFY the remembered binding before serving BYTES. The verified
+        # probe used to run only on a cache MISS — the rare path — while the
+        # common remembered path streamed from whatever the map said, with
+        # nothing checking that the replica owns the id or that the bytes
+        # belong to it. A single stale binding therefore served one job's
+        # video for another's id, indefinitely.
+        if target is not None and is_content(full) and not await _owns(target, job_id, headers):
+            _log_bad_binding(job_id, target)
+            bal.forget(job_id)
+            target = None
+        if target is None:
+            try:
+                target = await _find_owner(job_id, full, headers)
+            except AmbiguousOwner:
+                return JSONResponse(
+                    {
+                        "detail": f"job {job_id} is claimed by more than one "
+                        f"replica — refusing to guess which output is yours",
+                        "retryable": False,
+                    },
+                    status_code=409,
+                )
         if target is None:
             return JSONResponse({"detail": f"no replica holds job {job_id}"}, status_code=404)
         if request.method == "DELETE":
@@ -1227,8 +1844,8 @@ async def proxy(path: str, request: Request) -> Response:
             # which is exactly what job-scoped occupancy exists to prevent.
             resp = await _passthrough(target, full, request, headers, body)
             if resp.status_code < 400:
-                bal.end_job(job_id, ok=False)
-                _note_terminal(job_id, "cancelled", closed_by="delete")
+                if bal.end_job(job_id, ok=False):
+                    _note_terminal(job_id, "cancelled", closed_by="delete")
                 bal.forget(job_id)
                 await _safe_pump()  # a slot just freed
             return resp
@@ -1239,49 +1856,72 @@ async def proxy(path: str, request: Request) -> Response:
             resp = await _forward(target, full, request, headers, body)
             with contextlib.suppress(ValueError, KeyError, TypeError):
                 status = json.loads(resp.content).get("status")
-                if status in TERMINAL_STATUSES:
-                    bal.end_job(job_id, ok=status == "completed")
+                if status in TERMINAL_STATUSES and bal.end_job(job_id, ok=status == "completed"):
                     _note_terminal(job_id, str(status), closed_by="client")
                     # A replica just freed — hand it the next waiting ticket.
                     await _safe_pump()
+            out_headers = safe_headers(resp.headers)
+            if resp.status_code < 400:
+                # ONLY on success. Stamping it on the replica's 404 told the
+                # gateway "this fleet owns the job" about a fleet that had
+                # just denied it — and the gateway caches that binding until
+                # a 502, so one 404 poisoned the mapping for the process's
+                # whole life.
+                out_headers["x-deepme-job-id"] = job_id
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
-                headers=_safe_headers(resp.headers),
+                headers=out_headers,
                 media_type=resp.headers.get("content-type"),
             )
         # A sub-resource fetch. /content starts the artifact's re-fetch
-        # retention window on its FIRST read — recorded at request time
-        # (the download begins immediately) and only once, so repeat
-        # fetches inside the window do not keep extending it.
-        if full.rstrip("/").endswith("/content") and job_id not in _fetched:
-            import time as _time
-
-            _fetched[job_id] = _time.time()
-        return await _passthrough(target, full, request, headers, body)
+        # retention window on its FIRST COMPLETED read — a download cut
+        # mid-stream must not burn the only re-fetch window (marking at
+        # request time deleted billed work whose delivery a gateway restart
+        # had interrupted; the re-adopting client then fetched a 404).
+        fetched_id = job_id if full.rstrip("/").endswith("/content") else ""
+        return await _passthrough(
+            target, full, request, headers, body, fetched_id=fetched_id, job_header=job_id
+        )
 
     # 2. Everything else is new work: give it to the least busy replica.
     # Reap first — routing on stale occupancy would treat an idle replica as
     # busy and send work to a genuinely busier one.
     if request.method == "POST":
-        await _reap_stale_jobs()
+        # NOT reaped here. The maintenance beat reconciles every 10s, and
+        # doing it inline put an unbounded fan-out of probes on the
+        # latency-critical path: one wedged replica delayed a client's
+        # submission by the whole pass, the client timed out and retried,
+        # and each retry started another pass.
         queued = await _admit(full, request, headers, body)
         if queued is not None:
             return queued
     target = bal.pick()
     if target is None:
         return JSONResponse({"detail": "no healthy replica available"}, status_code=503)
-    began = bal.reserve(target)
+    # ONLY a POST is work. Reserving for every method meant a non-job-scoped
+    # GET (an operator curl of /v1/videos, a dashboard) against a wedged
+    # replica parked forever on the unbounded-read client holding a
+    # reservation that nothing ever released — free_slots() dropped
+    # permanently, and since admission delegates to it, the queue stopped
+    # draining on an idle fleet with nothing counted anywhere.
+    is_work = request.method == "POST"
+    began = bal.reserve(target) if is_work else 0.0
     try:
-        resp = await _forward(target, full, request, headers, body)
+        # A proxied read is also bounded: `client` has read=None, which only
+        # a streaming download should ever get.
+        resp = await _forward(target, full, request, headers, body, bounded=not is_work)
     except httpx.HTTPError as exc:
-        bal.release(target, failed=True)
+        if is_work:
+            bal.release(target, failed=True)
         bal.mark(target, healthy=False)
+        _publish("fleet", action="unhealthy", url=target)
         return JSONResponse({"detail": f"replica {target} unreachable: {exc}"}, status_code=502)
     except BaseException:
         # A disconnecting caller cancels this handler; the reserved slot
         # must not leak with it.
-        bal.release(target, failed=True)
+        if is_work:
+            bal.release(target, failed=True)
         raise
     # A response carrying a job id means the replica is now busy for minutes,
     # not for the milliseconds this call took. Hand the held slot to the job
@@ -1292,45 +1932,55 @@ async def proxy(path: str, request: Request) -> Response:
             payload = json.loads(resp.content)
             if payload.get("id") and payload.get("status") not in TERMINAL_STATUSES:
                 bal.release(target)
-                bal.begin_job(payload["id"], target, collection=_collection_of(full))
+                bal.begin_job(payload["id"], target, collection=collection_of(full))
                 with contextlib.suppress(ValueError, TypeError):
-                    _capture_meta(payload["id"], json.loads(body), via="direct")
+                    _capture_meta(payload["id"], json.loads(body), via="direct", backend=target)
                 opened = True
-    if not opened:
-        if request.method == "POST":
-            # Finished inside the call: a real, short job.
-            bal.record_inline(target, began, ok=resp.status_code < 400)
-        else:
-            # A proxied read is not work and must not reach the job counters.
-            bal.release(target, failed=resp.status_code >= 400)
+    if not opened and is_work:
+        # Finished inside the call: a real, short job. (A proxied read holds
+        # no reservation at all now, so there is nothing to release — and
+        # its 4xx no longer inflates a replica's `failed` count, which
+        # feeds every health and billing read.)
+        bal.record_inline(target, began, ok=resp.status_code < 400)
     return Response(
         content=resp.content,
         status_code=resp.status_code,
-        headers=_safe_headers(resp.headers),
+        headers=safe_headers(resp.headers),
         media_type=resp.headers.get("content-type"),
     )
 
 
-def _safe_headers(headers) -> dict[str, str]:
-    """Drop hop-by-hop headers; re-encoding here would contradict them."""
-    drop = {"content-length", "content-encoding", "transfer-encoding", "connection"}
-    return {k: v for k, v in headers.items() if k.lower() not in drop}
-
-
-async def _forward(target: str, path: str, request: Request, headers: dict, body: bytes):
-    return await client.request(
+async def _forward(
+    target: str, path: str, request: Request, headers: dict, body: bytes, *, bounded: bool = False
+):
+    """Proxy one request. `bounded` picks the control-plane client, whose
+    read timeout is finite — a submission may legitimately take a while,
+    but a proxied read must never park a coroutine forever."""
+    return await (ctl if bounded else client).request(
         request.method,
         f"{target}{path}",
-        headers={**headers, **_content_headers(request)},
+        headers={**headers, **content_headers(request)},
         content=body or None,
         params=_upstream_params(request),
     )
 
 
 async def _passthrough(
-    target: str, path: str, request: Request, headers: dict, body: bytes
+    target: str,
+    path: str,
+    request: Request,
+    headers: dict,
+    body: bytes,
+    *,
+    fetched_id: str = "",
+    job_header: str = "",
 ) -> Response:
-    """Stream a response through untouched — video downloads are large."""
+    """Stream a response through untouched — video downloads are large.
+
+    `fetched_id` marks the artifact fetched ONLY when the stream ran to
+    completion: the marker is set after the last byte is yielded, and a
+    client disconnect closes the generator before that line runs.
+    """
     req = client.build_request(
         request.method,
         f"{target}{path}",
@@ -1342,11 +1992,56 @@ async def _passthrough(
         resp = await client.send(req, stream=True)
     except httpx.HTTPError as exc:
         bal.mark(target, healthy=False)
+        _publish("fleet", action="unhealthy", url=target)
         return JSONResponse({"detail": f"replica {target} unreachable: {exc}"}, status_code=502)
+
+    async def _body():
+        # aiter_BYTES, not raw: _safe_headers strips content-encoding, so
+        # the body must be decoded to match. Forwarding raw gzip with the
+        # header removed handed the client binary garbage — invisibly, and
+        # twice over on the two-hop path through the gateway.
+        async for chunk in resp.aiter_bytes():
+            yield chunk
+        if fetched_id and resp.status_code == 200 and fetched_id not in _fetched:
+            import time as _time
+
+            _fetched[fetched_id] = _time.time()
+            _publish("fetch", job_id=fetched_id)
+            # DELIVERED, NOT YET DONE. The artifact is reclaimed when the
+            # client ACKNOWLEDGES it has persisted the bytes (DELETE on this
+            # same path), not when the last byte leaves here.
+            #
+            # Deleting on delivery made the transfer single-shot: a caller
+            # that received 200 and then failed to write — no such directory,
+            # disk full, killed mid-flush — lost the work permanently, with
+            # no way to ask for it again. That cost a real 5.5-minute clip.
+            # We control BOTH ends of this protocol, so "did the client keep
+            # it?" is answerable rather than assumed.
+            #
+            # The property that mattered is preserved: nothing that has been
+            # handed over can be handed over TWICE. `_fetched` is stamped
+            # here, at delivery, so the retention window starts now and runs
+            # whether or not an ack ever arrives — a client that dies mid-
+            # write cannot strand a file indefinitely, and the file is still
+            # gone long before any id could be reused. In the normal case the
+            # ack lands milliseconds after the write and the file's life on
+            # disk is shorter than it was under the previous rule's own
+            # streaming window.
+            # To DISK: a restart that forgot first-fetch times silently
+            # reset every 1h window back to 6h.
+            with contextlib.suppress(OSError):
+                _persist_membership()
+
+    out_headers = safe_headers(resp.headers)
+    if job_header:
+        # The EFFECTIVE job id rides every job-scoped response, so the
+        # gateway can bind ids to fleets from an authoritative statement
+        # instead of probing (see its _find_owner).
+        out_headers["x-deepme-job-id"] = job_header
     return StreamingResponse(
-        resp.aiter_raw(),
+        _body(),
         status_code=resp.status_code,
-        headers=_safe_headers(resp.headers),
+        headers=out_headers,
         background=_closer(resp),
     )
 
@@ -1355,8 +2050,3 @@ def _closer(resp):
     from starlette.background import BackgroundTask
 
     return BackgroundTask(resp.aclose)
-
-
-def _content_headers(request: Request) -> dict[str, str]:
-    ct = request.headers.get("content-type")
-    return {"content-type": ct} if ct else {}

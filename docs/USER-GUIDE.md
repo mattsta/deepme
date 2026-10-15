@@ -111,15 +111,56 @@ open("out.mp4", "wb").write(mp4)
 
 **When the fleet is busy you get `202` instead of `200`**, and the id is a
 `q_` queue ticket rather than a `vid_` job id. Poll it exactly the same way
-— while it waits the body carries `queue_position` and `billable: false`;
+— while it waits the body carries `queue_position`, `accepting_replicas`
+and `billable: false`;
 once a replica takes it, the same id transparently follows the real job
 (including `/content`), and the body's `id` switches to the real `vid_` id.
 `DELETE /v1/queue/{ticket}` abandons an unstarted ticket free of charge;
 `?queue=false` on the POST makes a busy fleet answer `503` instead of
 queueing. Full protocol: [INTERNAL-API.md](INTERNAL-API.md) §4.
 
-**Fetch promptly**: outputs are retained 6 hours if never downloaded, and
-deleted 1 hour after the first download.
+**Queueing is unbounded on purpose — `accepting_replicas` is how you tell
+waiting from stranded.** A busy fleet and a dead fleet both queue you, and
+both answer `200 {"status": "queued"}`, so elapsed time alone can never
+distinguish "next in line behind a 15-minute clip" from "nothing is running
+and nothing will be". The two are distinguished by one field:
+
+| `queue_position` | `accepting_replicas` | meaning                                        |
+| ---------------- | -------------------- | ---------------------------------------------- |
+| any              | `> 0`                | genuinely queued — wait, however long it takes |
+| any              | `0`                  | **stranded**: no replica can start this, ever  |
+
+Do not put a timeout on a queued ticket; time out on sustained
+`accepting_replicas: 0` instead. The balancer applies the same rule from its
+side and fails waiting tickets after ~5 minutes of zero accepting replicas
+(`FLEET_DEAD_STRIKES`, reset by any replica returning), so a stranded ticket
+ends as `status: "failed"`, `billable: false` with an error naming the fleet
+state. It was never submitted, so resubmitting when capacity returns costs
+nothing. The CLI does all of this for you and additionally **refuses to
+submit at all** when the fleet cannot serve the request.
+
+**Fetch, then ACK.** The server keeps your artifact until you confirm you
+have it:
+
+```python
+mp4 = httpx.get(f"{base}/{job['id']}/content", headers=h, timeout=600).content
+open("out.mp4", "wb").write(mp4)  # persist it FIRST
+httpx.delete(f"{base}/{job['id']}/content", headers=h)  # then ack
+```
+
+`DELETE .../content` means "I have these bytes, reclaim your copy". It is
+idempotent (retry a lost ack freely) and is **not** a cancellation — `DELETE`
+on the job itself cancels work; `DELETE` on `/content` only frees the file.
+
+Until you ack, `/content` is re-readable, so a failed write is recoverable:
+retry the GET. The retention clock starts at FIRST DELIVERY regardless, so a
+client that dies mid-write cannot strand a file — it is reclaimed 1 hour
+after first delivery, or 6 hours if never fetched at all. Ack promptly
+anyway: an unacked artifact is disk you are still holding.
+
+Do not skip the ack "because retention will get it": the window exists for
+crashes, not as a substitute. The CLI does this for you, and only after the
+bytes are `fsync`ed and renamed into place.
 
 Send only the parameters you mean to override — each release ships tuned
 defaults for resolution and step count. The accepted field set is per model
@@ -166,6 +207,23 @@ records the run. API callers get the same stage detail from
 ```bash
 uv run deepme generate -m h3-video "a corgi surfing at sunset" --seconds 4
 ```
+
+**Always pass `-m` for video.** `deepme model use` sets ONE default profile
+shared by the text commands and the video commands, and `switch` moves it —
+so whichever was deployed last wins, and a bare `deepme generate` inherits an
+LLM profile and refuses. `generate`, `batch`, `story` and `showcase` now fail
+immediately and name the video profiles instead of failing per item.
+
+Before submitting, those commands verify against `/v1/capacity` that a fleet
+serves the profile, is reachable, has at least one replica **accepting**, and
+serves the requested task — and refuse otherwise, because a submission a dead
+fleet accepts becomes a queue ticket that waits indefinitely (above).
+`--direct` skips the check: it deliberately bypasses the balancer, so fleet
+capacity says nothing about it.
+
+Cost control: `--steps` is the main lever and dominates wall time — the
+default 49 is roughly 15 minutes for a 5-second clip on this hardware, while
+`--steps 16` lands in a few minutes. Drop steps first when iterating.
 
 ### Conditioning modes
 
@@ -259,6 +317,7 @@ shapes):
 - `GET /v1/jobs` — every running/queued/recent job with its parameters
 - `GET /v1/events` — SSE firehose of every lifecycle transition
 - `GET /v1/videos/{id}/events` — per-job progress SSE (stages, position)
+- `DELETE /v1/videos/{id}/content` — artifact ack: reclaim a delivered file
 - `GET /v1/pricing` — the deployed price table with derivation
 - `GET /metrics` — Prometheus text, aggregated across fleets with
   `fleet="..."` labels

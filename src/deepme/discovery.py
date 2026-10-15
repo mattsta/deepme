@@ -138,7 +138,7 @@ def models() -> list[ModelEntry]:
     for profile in sorted(live):
         try:
             spec = profiles.load(profile)
-        except (Exception, SystemExit):
+        except Exception:
             continue
         if not spec.tasks:
             continue  # not a caller-facing generation model

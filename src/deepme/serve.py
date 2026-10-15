@@ -396,7 +396,7 @@ _STAGE = re.compile(r"\[(?P<label>[A-Za-z0-9_]*Stage)\] started")
 
 
 def stage_progress(
-    spec: RunSpec, within_s: float, *, unit: str | None = None
+    spec: RunSpec, within_s: float, *, unit: str | None = None, timeout: float = 600
 ) -> StageProgress | None:
     """Latest stage progress from the last `within_s` seconds of the journal.
 
@@ -407,12 +407,20 @@ def stage_progress(
     runs on whichever replica was free, and each replica logs only its own
     bar — the default (replica 0) is only right for single-replica and
     --direct runs; callers who know the owner must say so (media._owner_unit).
+
+    `timeout` bounds the SSH round trip. It defaults to remote.run's own 600s,
+    which is right for an operator running this once and catastrophic for the
+    poll loop, where this is called inside the tick callback on every cycle:
+    an unresponsive replica host could park a generation's progress display —
+    and the poll loop with it — for ten minutes per tick, uninterruptibly.
+    Callers on a clock must pass their own bound (see media._STAGE_PROBE_S).
     """
     window = max(int(within_s) + 5, 10)
     r = remote.run(
         f"journalctl -u {unit or spec.unit} --since '-{window}s' --no-pager "
         "-o cat 2>/dev/null | grep -aE 'it\\]|Stage\\] started' | tail -40",
         check=False,
+        timeout=timeout,
     )
     # Whichever appeared LAST is what the pipeline is doing now: a step bar
     # while one is running, otherwise the name of the current stage. The job

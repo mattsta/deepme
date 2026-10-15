@@ -357,7 +357,7 @@ def build(
         # config dims for perf estimation, params, formats.
         try:
             deep = hfmeta.get(m["id"], refresh=refresh)
-        except (Exception, SystemExit):
+        except Exception:
             # (gated/missing/unreachable) must not abort the whole catalog
             deep = None
         if deep:

@@ -68,7 +68,7 @@ def snapshot(specs: list[RunSpec] | None = None) -> list[UnitHealth]:
         for name in profiles.list_profiles():
             try:
                 specs.append(profiles.load(name))
-            except (Exception, SystemExit):
+            except Exception:
                 # A gated repo or cold metadata cache must not blind the watch
                 # for every OTHER model.
                 continue

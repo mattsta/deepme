@@ -45,6 +45,19 @@ SGLANG_USE_RUNAI_MODEL_STREAMER = "0"
 # inert (stock engine behaviour) if this is unset.
 DEEPME_SHARED_WEIGHTS = "1"
 
+# Let the caching allocator grow segments in place instead of stranding
+# partial blocks. MEASURED NEED, not a precaution: a 15s clip failed with
+# "tried to allocate 2.92GiB, 974MiB free" while the SAME process reported
+# 6.02GiB "reserved but unallocated" — i.e. twice the shortfall was already
+# held by the allocator and unusable. Long clips fragment worse because
+# their activation tensors are large and short-lived, and this fleet mixes
+# 5s and 15s requests on one replica, so block sizes never settle.
+#
+# Duration is what moves the peak (envelope below): 15s is the largest
+# legal request at 26.7GiB of 31.36GiB, which leaves no room to also lose
+# 6GiB to fragmentation.
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+
 [serve.engine_args]
 vllm = []
 # Vendor's 2xRTX 5090 recipe, verbatim in intent:
@@ -75,6 +88,12 @@ sglang = [
   # denoise pass. That matters disproportionately here because we are
   # PCIe-bound, not compute-bound: the DiT streams from host RAM every step,
   # so a batched pass streams those weights ONCE for both requests.
+  # RISK AT 15s, unverified: the envelope below is PER REQUEST, and two
+  # requests batch only when their sampling signature matches — which two
+  # 15s clips do. A batched pair of largest-legal requests has never been
+  # measured, and 2 x 26.7GiB cannot fit 31.36GiB, so the pass must be
+  # sharing most of that peak for this to be safe. If OOMs persist after
+  # expandable_segments, drop this to 1 and re-measure before restoring it.
   "--batching-max-size", "2",
   # store_true, NOT the StoreBoolean used by neighbouring flags in the same
   # parser — passing a value makes it a stray positional and the server exits

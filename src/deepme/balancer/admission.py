@@ -98,14 +98,37 @@ class AdmissionQueue:
         return self._tickets.get(ticket_id)
 
     def waiting(self) -> list[Ticket]:
-        """Everything still ours, in the order it will be served."""
+        """Everything still ours, in the order it will be served.
+
+        O(n log n), so callers that need MANY positions must call this ONCE
+        and enumerate (see `positions`) — asking per ticket re-sorted the
+        whole queue each time, which is O(n^2 log n) with no await in the
+        loop and pinned the event loop for seconds at the prune bound.
+        """
         return sorted(
             (t for t in self._tickets.values() if t.state == WAITING),
             key=lambda t: (t.priority, t.seq),
         )
 
     def next_ready(self) -> Ticket | None:
-        return next(iter(self.waiting()), None)
+        """The head of the queue, without sorting the tail.
+
+        min() is O(n) against sorted()'s O(n log n), and the pump calls this
+        once per submitted ticket.
+        """
+        return min(
+            (t for t in self._tickets.values() if t.state == WAITING),
+            key=lambda t: (t.priority, t.seq),
+            default=None,
+        )
+
+    def positions(self) -> dict[str, int]:
+        """ticket id -> queue position, computed in ONE pass.
+
+        For listing endpoints that would otherwise ask `position()` per
+        ticket.
+        """
+        return {t.ticket_id: i for i, t in enumerate(self.waiting())}
 
     def claim(self, ticket_id: str) -> bool:
         """Take exclusive ownership of a ticket for submission.
@@ -133,15 +156,22 @@ class AdmissionQueue:
         if ticket is not None and ticket.state == SUBMITTING:
             ticket.state = WAITING
 
-    def mark_rejected(self, ticket_id: str, detail: str) -> None:
+    def mark_rejected(self, ticket_id: str, detail: str) -> bool:
         """The replica answered and said no. Terminal, and it must SAY so:
         retiring a rejected ticket as 'submitted' left callers polling
-        'queued' forever for work that never ran and never will."""
+        'queued' forever for work that never ran and never will.
+
+        Returns whether this call was the one that refused it, so a caller
+        refusing many at once can count what it actually did rather than what
+        it attempted. A ticket that reached a replica (SUBMITTED) is never
+        touched — only never-billed work can be refused.
+        """
         ticket = self._tickets.get(ticket_id)
         if ticket is None or ticket.state not in (WAITING, SUBMITTING):
-            return
+            return False
         ticket.state = REJECTED
         ticket.error = detail
+        return True
 
     def position(self, ticket_id: str) -> int | None:
         """0 = next to be submitted. None once it is no longer waiting."""
@@ -221,16 +251,28 @@ class AdmissionQueue:
     def forget(self, ticket_id: str) -> None:
         self._tickets.pop(ticket_id, None)
 
-    def prune(self, *, keep: int = 5000) -> int:
+    def prune(self, *, keep: int = 5000, live_jobs: set[str] | None = None) -> int:
         """Drop the oldest settled tickets so a long-lived queue stays bounded.
 
         WAITING is never dropped, and neither is SUBMITTING: that ticket's
         POST is on the wire RIGHT NOW, and deleting it makes the completion
         callbacks (mark_submitted / release_claim) silent no-ops — the job
         runs but the handover is lost, or a transport-error requeue vanishes.
+
+        `live_jobs` protects the ticket->job binding of work that is STILL
+        RUNNING. The platform promises a caller that the id it was handed
+        keeps working "including /content"; dropping a SUBMITTED ticket
+        whose job is mid-generation broke that promise into a 404, which
+        the client reads as a lost ticket and resubmits — the same clip
+        generated and billed twice.
         """
+        live = live_jobs or set()
         settled = sorted(
-            (t for t in self._tickets.values() if t.state not in (WAITING, SUBMITTING)),
+            (
+                t
+                for t in self._tickets.values()
+                if t.state not in (WAITING, SUBMITTING) and (t.job_id or "") not in live
+            ),
             key=lambda t: t.seq,
         )
         excess = max(len(settled) - keep, 0)

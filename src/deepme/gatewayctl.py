@@ -84,7 +84,7 @@ def discover_routes() -> list[dict]:
     for name in sorted(live):
         try:
             spec = profiles.load(name)
-        except (Exception, SystemExit):
+        except Exception:
             continue
         if not spec.tasks:
             continue
@@ -110,6 +110,11 @@ def start(routes: list[dict] | None = None) -> str:
         )
     for name in ("route.py", "server.py"):
         remote.write_remote_file(f"{GATEWAY_DIR}/{name}", (LOCAL / name).read_text())
+    # Shared with the balancer — see balancerctl for why this is a separate
+    # push rather than a member of the tuple above.
+    remote.write_remote_file(
+        f"{GATEWAY_DIR}/proxycore.py", (config.SHARED_DIR / "proxycore.py").read_text()
+    )
     # Pricing is frozen in at start, exactly like routes: the derivation
     # (economics.toml x measured occupancy) happens HERE, where the repo is,
     # and the gateway only applies the live surge tier to a static table.
@@ -151,6 +156,16 @@ def status() -> str:
     return r.stdout.strip() or r.stderr.strip() or "unknown"
 
 
+def logs(lines: int = 100) -> str:
+    """The gateway's journal. Every other tier had this; the gateway did
+    not, so the one service that decides WHERE a job went had no readable
+    history."""
+    return remote.run(
+        f"sudo journalctl -u {UNIT} -n {lines} --no-pager -o cat",
+        check=False,
+    ).stdout
+
+
 def api_base() -> str:
     return f"http://{config.SSH_HOST}:{GATEWAY_PORT}"
 
@@ -158,7 +173,7 @@ def api_base() -> str:
 def routes() -> dict:
     import httpx
 
-    r = httpx.get(f"{api_base()}/gateway/routes", timeout=10)
+    r = httpx.get(f"{api_base()}/gateway/routes", timeout=10, headers=balancerctl.auth_headers())
     r.raise_for_status()
     return dict(r.json())
 
@@ -168,6 +183,16 @@ def capacity() -> dict:
     import httpx
 
     r = httpx.get(f"{api_base()}/v1/capacity", timeout=10)
+    r.raise_for_status()
+    return dict(r.json())
+
+
+def queue() -> dict:
+    """What is WAITING, per fleet. The running set alone cannot tell a live
+    ticket from one a balancer restart destroyed."""
+    import httpx
+
+    r = httpx.get(f"{api_base()}/v1/queue", timeout=10)
     r.raise_for_status()
     return dict(r.json())
 
@@ -189,7 +214,12 @@ def repoint(routes_list: list[dict]) -> bool:
             "catalog": json.loads(catalog_json()),
             "pricing": economics.pricing_json(economics.derive(economics.load())),
         }
-        r = httpx.post(f"{api_base()}/gateway/reload", json=payload, timeout=15)
+        r = httpx.post(
+            f"{api_base()}/gateway/reload",
+            json=payload,
+            timeout=15,
+            headers=balancerctl.auth_headers(),
+        )
         return r.status_code == 200
     except Exception:
         return False

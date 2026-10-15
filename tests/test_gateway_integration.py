@@ -98,6 +98,10 @@ def gw(fleets):
 
     os.environ.update(GATEWAY_ROUTES=json.dumps(ROUTES), GATEWAY_API_KEY="")
     directory = SRC / "gateway"
+    # proxycore is deployed FLAT next to server.py, so it must be importable
+    # by bare name here too — otherwise the tests exercise an import graph
+    # the server never has.
+    sys.path.insert(0, str(SRC / "shared"))
     sys.path.insert(0, str(directory))
     try:
         spec = importlib.util.spec_from_file_location("gw_integration", directory / "server.py")
@@ -107,6 +111,9 @@ def gw(fleets):
     finally:
         sys.path.remove(str(directory))
     mod.client = httpx.AsyncClient(transport=httpx.MockTransport(fleets.handler))
+    # The control-plane client is a separate pool by design (a streaming
+    # download must not starve capacity reads) — same fake fleet behind it.
+    mod.ctl = httpx.AsyncClient(transport=httpx.MockTransport(fleets.handler))
     return mod
 
 
@@ -285,6 +292,7 @@ def priced_gw(fleets, monkeypatch):
 
     os.environ.update(GATEWAY_ROUTES=json.dumps(ROUTES), GATEWAY_API_KEY="")
     directory = SRC / "gateway"
+    sys.path.insert(0, str(SRC / "shared"))
     sys.path.insert(0, str(directory))
     try:
         spec = importlib.util.spec_from_file_location("gw_priced", directory / "server.py")
@@ -294,6 +302,9 @@ def priced_gw(fleets, monkeypatch):
     finally:
         sys.path.remove(str(directory))
     mod.client = httpx.AsyncClient(transport=httpx.MockTransport(fleets.handler))
+    # The control-plane client is a separate pool by design (a streaming
+    # download must not starve capacity reads) — same fake fleet behind it.
+    mod.ctl = httpx.AsyncClient(transport=httpx.MockTransport(fleets.handler))
     return mod
 
 
@@ -474,7 +485,9 @@ def test_jobs_and_metrics_aggregate_across_fleets(gw, fleets):
             return _resp(200, raw=b"deepme_slots_free 2\n")
         return fleets.handler(request)
 
-    gw.client = httpx.AsyncClient(transport=httpx.MockTransport(with_obs))
+    # Observability reads go over the CONTROL-PLANE client — the bounded
+    # pool that a streaming download can never starve.
+    gw.ctl = httpx.AsyncClient(transport=httpx.MockTransport(with_obs))
     with TestClient(gw.app) as client:
         body = client.get("/v1/jobs").json()
         assert {f["profile"] for f in body["fleets"]} == {"h3-video", "h3-ref"}
@@ -512,3 +525,89 @@ def test_the_gateway_firehose_tags_fleets_and_reports_outages(gw, fleets):
     kinds = {(e.get("type"), e.get("fleet")) for e in seen}
     assert ("started", "h3-video") in kinds
     assert ("fleet_down", "h3-ref") in kinds
+
+
+# --------------------------------------------------------------------------
+# Identity integrity across fleets
+
+
+def test_ambiguous_cross_fleet_ownership_refuses_rather_than_guesses(gw):
+    """Replica-minted ids are not namespaced across fleets. When two fleets
+    both answer for one id, serving either would hand one customer another
+    customer's video — the only safe answer is no answer.
+
+    409, not 404: the id exists in more than one place, which is a CONFLICT.
+    404 means "unknown", which a client reads as safe to resubmit — and that
+    bills the generation a second time. The balancer already answered 409
+    here; the gateway said 404 until proxycore made them one code path."""
+
+    def both_claim(request):
+        return httpx.Response(200, json={"id": "vid_dup", "status": "queued"})
+
+    gw.ctl = httpx.AsyncClient(transport=httpx.MockTransport(both_claim))
+    with TestClient(gw.app) as client:
+        r = client.get("/v1/videos/vid_dup")
+    assert r.status_code == 409
+
+
+def test_one_claimant_plus_an_unreachable_fleet_is_not_unambiguous(gw):
+    """The trap the gateway was blind to before proxycore.
+
+    One fleet claims the id and another cannot be asked. Counting only the
+    claimants makes that look like a clean single owner — but the fleet we
+    could not reach may be the REAL owner, and the claimant may be holding a
+    stale colliding id. Streaming on that binding is precisely how one
+    caller's video was delivered for another caller's id."""
+
+    def one_up_one_down(request):
+        if request.url.host == "fleet-b":
+            raise httpx.ConnectError("fleet down", request=request)
+        return httpx.Response(200, json={"id": "vid_x", "status": "queued"})
+
+    gw.table = gw.build(
+        [
+            {"model": "m", "profile": "p", "tasks": ["t2v"], "url": "http://fleet-a:9100"},
+            {"model": "m", "profile": "p", "tasks": ["t2v"], "url": "http://fleet-b:9200"},
+        ]
+    )
+    gw.ctl = httpx.AsyncClient(transport=httpx.MockTransport(one_up_one_down))
+    with TestClient(gw.app) as client:
+        r = client.get("/v1/videos/vid_x")
+    assert r.status_code == 409, "an incomplete poll is a conflict, not a clean owner"
+
+
+def test_a_fleet_answering_for_a_foreign_id_is_not_believed(gw):
+    """A 200 must NAME the probed id to count as ownership."""
+
+    def foreign(request):
+        if "fleet-video" in str(request.url):
+            # Answers happily... about a different job entirely.
+            return _resp(200, {"id": "vid_other", "status": "queued"})
+        return _resp(200, {"id": "vid_mine", "status": "queued"})
+
+    t = httpx.AsyncClient(transport=httpx.MockTransport(foreign))
+    gw.ctl = t
+    gw.client = t
+    with TestClient(gw.app) as client:
+        r = client.get("/v1/videos/vid_mine")
+    assert r.status_code == 200
+    assert r.json()["id"] == "vid_mine"
+    assert gw.table.owner("vid_mine") == REF, "verified claimant only"
+
+
+def test_the_gateway_learns_effective_ids_from_the_balancer_header(gw):
+    """POST responses only ever teach the gateway TICKET ids; the balancer
+    stamps every job-scoped response with the effective job id so the real
+    id never has to be discovered by probing."""
+    target = gw.table.routes[0].url
+    gw.table.remember("q_tkt", target)
+
+    def with_header(request):
+        r = _resp(200, {"id": "vid_real", "status": "queued"})
+        r.headers["x-deepme-job-id"] = "vid_real"
+        return r
+
+    gw.client = httpx.AsyncClient(transport=httpx.MockTransport(with_header))
+    with TestClient(gw.app) as client:
+        client.get("/v1/videos/q_tkt")
+    assert gw.table.owner("vid_real") == target

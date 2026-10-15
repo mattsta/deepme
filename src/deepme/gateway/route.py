@@ -16,6 +16,7 @@ tested directly.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 
@@ -48,7 +49,7 @@ class RoutingTable:
     routes: list[Route] = field(default_factory=list)
     # A job id only means something to the fleet that minted it, and now the
     # id travels through two hops, so the gateway keeps its own mapping.
-    _owner: dict[str, str] = field(default_factory=dict)
+    _owner: OrderedDict[str, str] = field(default_factory=OrderedDict)
     max_jobs: int = 50_000
 
     def models(self) -> list[str]:
@@ -103,14 +104,35 @@ class RoutingTable:
         return dict(self._owner)
 
     def remember(self, job_id: str, url: str) -> None:
+        """Bind a job to its fleet, LRU-bounded.
+
+        Re-remembering REFRESHES recency. Plain insertion-order eviction
+        aged out ids purely by when they were first seen, so a job being
+        actively polled could lose its mapping under churn — and the next
+        poll then fell back to the cross-fleet owner probe, the path that
+        served one customer another customer's video.
+        """
         if not job_id:
             return
-        if len(self._owner) >= self.max_jobs:
-            self._owner.pop(next(iter(self._owner)), None)
+        if job_id in self._owner:
+            self._owner.move_to_end(job_id)
+            self._owner[job_id] = url
+            return
+        while len(self._owner) >= self.max_jobs:
+            self._owner.popitem(last=False)
         self._owner[job_id] = url
 
     def owner(self, job_id: str) -> str | None:
-        return self._owner.get(job_id)
+        """The fleet holding this job — a HIT refreshes recency.
+
+        `remember` refreshes on write, but reads did not, so an id that was
+        polled every 5 seconds still aged out purely by insertion order and
+        fell into the owner probe.
+        """
+        url = self._owner.get(job_id)
+        if url is not None:
+            self._owner.move_to_end(job_id)
+        return url
 
     def forget(self, job_id: str) -> None:
         self._owner.pop(job_id, None)

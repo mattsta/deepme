@@ -14,6 +14,7 @@ across replicas, and writes a manifest recording exactly how each was made.
 from __future__ import annotations
 
 import concurrent.futures as futures
+import contextlib
 import dataclasses
 import json
 import time
@@ -97,7 +98,20 @@ def generate_one(spec: RunSpec, clip: Clip, out_dir: Path, timeout: float) -> Cl
             out_dir=out_dir,
             timeout=timeout,
         )
-    except SystemExit as exc:
+    except media.RequestInvalid:
+        # A malformed reel is not N independent clip failures — it is one
+        # loud error before any GPU time is spent. Absorbing it per clip
+        # produced N red rows and a manifest full of `ok: false`.
+        raise
+    except InterruptedError:
+        # A cancelled clip is not a FAILED clip: the job keeps generating
+        # server-side. Propagate so the reel stops rather than recording a
+        # lie about work that is still running.
+        raise
+    except Exception as exc:
+        # Every failure currency the client has, in one clause. Catching
+        # only SystemExit let a StalledError (a plain exception) escape
+        # through future.result() and abort the whole reel.
         return ClipResult(clip, False, None, time.monotonic() - started, "", str(exc))
     dest = result.path
     if dest and dest.exists():
@@ -133,15 +147,28 @@ def run(
     out.mkdir(parents=True, exist_ok=True)
     workers = concurrency or len(clips)
     results: list[ClipResult] = []
-    with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+    order = [c.name for c in clips]
+    pool = futures.ThreadPoolExecutor(max_workers=workers)
+    try:
         pending = {pool.submit(generate_one, spec, clip, out, timeout): clip for clip in clips}
         for future in futures.as_completed(pending):
             result = future.result()
             results.append(result)
             if on_done:
                 on_done(result)
-    results.sort(key=lambda r: [c.name for c in clips].index(r.clip.name))
-    write_manifest(out, spec, results)
+    except BaseException:
+        # `with` alone would let every UNSTARTED clip run to completion on
+        # its way out — each one a new billable job submitted during what
+        # the operator experiences as cancellation.
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+        # The manifest is the deliverable's record. Writing it only on the
+        # happy path discarded the proof of every clip that DID finish.
+        results.sort(key=lambda r: order.index(r.clip.name))
+        with contextlib.suppress(OSError):
+            write_manifest(out, spec, results)
     return results
 
 

@@ -89,7 +89,7 @@ def test_traversal_and_injection_are_rejected_at_load(bad, tmp_path, monkeypatch
     )
     monkeypatch.setattr(config, "STATE_DIR", tmp_path)
     (tmp_path / "m.toml").write_text(f'[model]\nrepo = "Org/Repo-X"\nsubfolder = "{bad}"\n')
-    with pytest.raises(SystemExit, match="invalid subfolder"):
+    with pytest.raises(profiles.ProfileError, match="invalid subfolder"):
         profiles.load("m")
 
 
@@ -179,7 +179,7 @@ def test_malformed_env_keys_are_rejected(bad_key, tmp_path, monkeypatch):
     (tmp_path / "m.toml").write_text(
         f'[model]\nrepo = "Org/Repo-X"\n\n[serve.env]\n"{bad_key}" = "1"\n'
     )
-    with pytest.raises(SystemExit, match=re.escape("invalid [serve.env] entry")):
+    with pytest.raises(profiles.ProfileError, match=re.escape("invalid [serve.env] entry")):
         profiles.load("m")
 
 

@@ -16,8 +16,10 @@ weight sizes/shards come from the Hugging Face API). Most commands accept
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -25,8 +27,21 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from . import batch as batch_mod
 from . import bench as bench_mod
-from . import client, config, download, hfmeta, profiles, provision, remote, runs, serve
+from . import (
+    client,
+    config,
+    download,
+    hfmeta,
+    media,
+    ports,
+    profiles,
+    provision,
+    remote,
+    runs,
+    serve,
+)
 from . import gpus as gpus_mod
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
@@ -325,16 +340,36 @@ def reboot(
     import time as _time
 
     if not force:
+        fleets = None
         with contextlib.suppress(Exception):
             from . import gatewayctl
 
-            busy = sum(int(f.get("busy") or 0) for f in gatewayctl.capacity().get("fleets", []))
-            if busy:
-                raise SystemExit(
-                    f"{busy} generation(s) running — a reboot kills them "
-                    f"mid-denoise. Wait for them (`deepme capacity --watch`) "
-                    f"or pass --force to reboot anyway."
-                )
+            fleets = gatewayctl.capacity().get("fleets", [])
+        # An UNREACHABLE fleet reports busy=0 — it is "no answer", not "no
+        # work". Summing it as zero let the most destructive command
+        # conclude the box was idle and reboot into live generations. The
+        # safe reading of an unanswered question is to refuse.
+        blind = [f for f in (fleets or []) if not f.get("reachable", True)]
+        if fleets is None:
+            raise SystemExit(
+                "cannot reach the gateway to check for running generations — "
+                "a reboot would kill any mid-denoise. Check `deepme gateway "
+                "status`, or pass --force to reboot anyway."
+            )
+        if blind:
+            names = ", ".join(str(f.get("profile") or "?") for f in blind)
+            raise SystemExit(
+                f"{len(blind)} fleet(s) could not be asked what they are "
+                f"running ({names}) — a reboot kills anything mid-denoise. "
+                f"Retry, or pass --force to reboot anyway."
+            )
+        busy = sum(int(f.get("busy") or 0) for f in fleets)
+        if busy:
+            raise SystemExit(
+                f"{busy} generation(s) running — a reboot kills them "
+                f"mid-denoise. Wait for them (`deepme capacity --watch`) "
+                f"or pass --force to reboot anyway."
+            )
     if not typer.confirm("Reboot the server now?", default=False):
         raise SystemExit("aborted")
     runs.record("reboot", None, outcome="began", detail={"forced": force})
@@ -381,7 +416,7 @@ def status() -> None:
         # offline or a gated repo must not crash the whole fleet view.
         try:
             spec = profiles.load(name)
-        except (Exception, SystemExit) as exc:
+        except Exception as exc:
             console.print(
                 f"[bold]{name}[/bold] [dim](metadata unavailable: {type(exc).__name__})[/dim]"
             )
@@ -459,14 +494,50 @@ def balancer_start(
     console.print(balancerctl.start(specs, force=force))
     # A (re)start freezes membership and, with --force, destroys a queue —
     # the fleet mutation most likely to be asked about afterwards.
-    runs.record(
-        "balancer-start", spec, outcome="ok", detail={"replicas": len(specs), "forced": force}
-    )
     base = balancerctl.api_base(spec.profile)
+    # PROVE it came up. A green banner printed straight after systemctl
+    # reported success for a service that was crash-looping on a bad
+    # environment — the operator only found out when work stopped moving.
+    healthy = _await_service(
+        lambda: balancerctl.stats(spec.profile),
+        what=f"balancer for {spec.profile}",
+    )
+    runs.record(
+        "balancer-start",
+        spec,
+        outcome="ok" if healthy else "failed",
+        detail={"replicas": len(specs), "forced": force, "healthy": healthy},
+    )
+    if not healthy:
+        raise SystemExit(
+            f"balancer unit started but {base}/balancer/stats never answered — "
+            f"read `deepme balancer logs -m {spec.profile}`"
+        )
     console.print(
         f"[green]balancer[/green] {base}/v1 -> "
         f"{len(specs)} replica(s); stats at {base}/balancer/stats"
     )
+
+
+def _await_service(probe, *, what: str, tries: int = 12, every: float = 2.5) -> bool:
+    """Poll a service's own endpoint until it answers. True if it did.
+
+    `systemctl restart` returning 0 means the unit was FORKED, not that the
+    process is serving — and several commands treated the two as the same
+    thing, reporting success for services that never came up. Boot work
+    (occupancy recovery) makes the first seconds legitimately silent, so
+    this waits rather than probing once.
+    """
+    import time as _time
+
+    for attempt in range(tries):
+        with contextlib.suppress(Exception):
+            probe()
+            return True
+        if attempt == 0:
+            console.print(f"[dim]waiting for {what} to answer…[/dim]")
+        _time.sleep(every)
+    return False
 
 
 @balancer_app.command("stop")
@@ -480,12 +551,62 @@ def balancer_stop(model: str = ModelOpt) -> None:
     console.print(f"stopped {balancerctl.unit_for(spec.profile)}")
 
 
+@balancer_app.command("audit")
+def balancer_audit(
+    model: str = ModelOpt,
+    lines: int = typer.Option(200, "-n", help="Most recent entries"),
+    grep: str = typer.Option(
+        "", "--grep", help="Only entries containing this text (e.g. a job id)"
+    ),
+) -> None:
+    """The platform's persistent lifecycle trail: queued, handover, started,
+    terminal, fetch, reclaimed, retention, owner_rejected.
+
+    The live event ring holds 500 entries in memory and dies with the
+    process — this file is the only thing that can answer what happened
+    before the last restart. Pass a job id to --grep to follow one job end
+    to end.
+    """
+    from . import balancerctl
+
+    spec = profiles.load(model)
+    body = balancerctl.audit(spec.profile, lines, grep)
+    if not body.strip():
+        console.print("[dim]no audit entries (is the balancer new, or WORK_DIR unset?)[/dim]")
+        return
+    console.print(body)
+
+
+@balancer_app.command("logs")
+def balancer_logs(
+    model: str = ModelOpt,
+    lines: int = typer.Option(100, "-n", help="Journal lines to fetch"),
+) -> None:
+    """The balancer's own journal — strikes, reaps, revives, retention.
+
+    This is where lost-job forensics live: every `presumed lost after N
+    probes` line names the job, its replica, and WHY (404 vs unreachable).
+    """
+    from . import balancerctl
+
+    spec = profiles.load(model)
+    console.print(balancerctl.logs(spec.profile, lines) or "[dim]no output[/dim]")
+
+
 @balancer_app.command("status")
-def balancer_status(model: str = ModelOpt) -> None:
+def balancer_status(
+    model: str = ModelOpt,
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable, for scripts"),
+) -> None:
     """Per-replica load as this model's balancer sees it."""
     from . import balancerctl
 
     spec = profiles.load(model)
+    if as_json:
+        # The whole snapshot, unflattened — a watchdog wants the numbers,
+        # not the table.
+        console.print_json(json.dumps(balancerctl.stats(spec.profile)))
+        return
     console.print(
         f"unit={balancerctl.unit_for(spec.profile)} state={balancerctl.status(spec.profile)}"
     )
@@ -521,6 +642,34 @@ def balancer_status(model: str = ModelOpt) -> None:
     console.print(
         f"[dim]tracked jobs: {snap['tracked_jobs']} · reaped: {snap.get('reaped_jobs', 0)}[/dim]"
     )
+    # The queue an operator was previously told to curl for.
+    queue = snap.get("queue") or {}
+    if queue:
+        by_state = ", ".join(f"{k}={v}" for k, v in sorted((queue.get("by_state") or {}).items()))
+        console.print(
+            f"[dim]queue: {queue.get('waiting', 0)} waiting"
+            + (f" · {by_state}" if by_state else "")
+            + "[/dim]"
+        )
+    # Is the platform's own machinery alive? A dead maintenance loop looks
+    # exactly like a healthy idle one unless the failures are counted AND
+    # shown; they were counted but lived only in /metrics, which no command
+    # reads.
+    maint = snap.get("maintenance") or {}
+    if maint:
+        errs = int(maint.get("errors_total", 0))
+        rerrs = int(maint.get("retention_errors_total", 0))
+        style = "red" if errs or rerrs else "dim"
+        audit = "on" if maint.get("audit_enabled") else "[yellow]OFF[/yellow]"
+        console.print(
+            f"[{style}]maintenance: {errs} error(s), retention {rerrs} error(s)"
+            f"[/{style}] [dim]· audit {audit} · boot {maint.get('boot', '?')}[/dim]"
+        )
+        if errs or rerrs:
+            console.print(
+                "[dim]  the maintenance beat enforces the liveness invariant — "
+                "read `deepme balancer logs -m <model>`[/dim]"
+            )
 
 
 patches_app = typer.Typer(help="Vendored engine patches (apply, verify, re-base)")
@@ -633,7 +782,10 @@ def job_progress(
     """
     from . import media
 
-    spec, _via = front_end(profiles.load(model))
+    # check=False: this only resolves an ADDRESS to read progress from. A
+    # servability check would refuse to tell an operator what happened to a
+    # job on a fleet that has since gone down — exactly when they need it.
+    spec, _via = front_end(profiles.load(model), check=False)
     unit = None
     try:
         unit = media._owner_unit(spec, job_id)
@@ -896,6 +1048,12 @@ def top_cmd(
     watch: bool = typer.Option(False, "--watch", "-w", help="Refresh until ^C"),
     every: float = typer.Option(5.0, "--every", help="Seconds between refreshes"),
     as_json: bool = typer.Option(False, "--json", help="Machine-readable"),
+    recent: int = typer.Option(
+        3,
+        "--recent",
+        help="Terminal jobs to show per fleet (the server keeps 50) — raise "
+        "this to see who closed what where when hunting lost jobs",
+    ),
 ) -> None:
     """Everything running on the platform, with stages — the operator view.
 
@@ -947,7 +1105,7 @@ def top_cmd(
                 table.add_row(prof, "[red]unreachable[/red]", "", "", "", "")
                 continue
             spec = None
-            with contextlib.suppress(Exception, SystemExit):
+            with contextlib.suppress(Exception):
                 spec = profiles.load(prof)
             for j in fleet.get("running", []):
                 phase = ""
@@ -986,13 +1144,17 @@ def top_cmd(
                     f"[yellow]queued #{q.get('position')}[/yellow] p{q.get('priority')}",
                     "",
                 )
-            for r_ in fleet.get("recent", [])[:3]:
+            for r_ in fleet.get("recent", [])[:recent]:
+                # Backend and closer travel together: "failed (reaper) @8100"
+                # is a diagnosis; "failed" alone is a mystery.
+                where = str(r_.get("backend") or "").rsplit(":", 1)[-1]
                 table.add_row(
                     prof,
                     str(r_.get("job_id", ""))[:12],
                     str(r_.get("task") or ""),
                     _safe(str(r_.get("prompt") or "")[:36]),
-                    f"[dim]{r_.get('status')} ({r_.get('closed_by')})[/dim]",
+                    f"[dim]{r_.get('status')} ({r_.get('closed_by')})"
+                    f"{' @' + where if where else ''}[/dim]",
                     "",
                 )
         return table
@@ -1025,10 +1187,24 @@ def capacity_cmd(
     """
     import time as _time
 
+    import httpx
+
     from . import gatewayctl
 
+    def _fetch() -> dict:
+        """Explain, never stack-trace. This is the command the runbook
+        recommends for watching a drain, so a down gateway must produce a
+        next action — `top` already does this and `capacity` did not."""
+        try:
+            return gatewayctl.capacity()
+        except httpx.HTTPError as exc:
+            raise SystemExit(
+                f"gateway unreachable ({exc}) — check `deepme gateway status`, "
+                f"or read `deepme gateway logs`"
+            ) from None
+
     def render() -> Table:
-        body = gatewayctl.capacity()
+        body = _fetch()
         table = Table(
             box=None,
             pad_edge=False,
@@ -1066,7 +1242,7 @@ def capacity_cmd(
         return table
 
     if as_json:
-        console.print_json(json.dumps(gatewayctl.capacity()))
+        console.print_json(json.dumps(_fetch()))
         return
     if not watch:
         console.print(render())
@@ -1079,7 +1255,10 @@ def capacity_cmd(
                 _time.sleep(every)
                 live.update(render())
     except KeyboardInterrupt:
-        raise SystemExit(0) from None  # a watch ends when you stop watching
+        # 130, like every other interrupt path: exiting 0 made
+        # `deepme capacity -w && deploy` treat an abandoned watch as a
+        # successful precondition.
+        raise SystemExit(130) from None
 
 
 @app.command("discover")
@@ -1173,7 +1352,16 @@ def gateway_start(
     if setup:
         console.print(gatewayctl.setup())
     console.print(gatewayctl.start())
-    runs.record("gateway-start", None, outcome="ok")
+    # PROVE it. A gateway crash-looping on a bad routes environment used to
+    # print this same green banner: the unit forked, so systemctl returned
+    # 0, and nothing ever asked the service itself.
+    healthy = _await_service(gatewayctl.routes, what="gateway")
+    runs.record("gateway-start", None, outcome="ok" if healthy else "failed")
+    if not healthy:
+        raise SystemExit(
+            f"gateway unit started but {gatewayctl.api_base()}/gateway/routes "
+            f"never answered — read `deepme gateway logs`"
+        )
     console.print(
         f"[green]gateway[/green] {gatewayctl.api_base()}/v1 — "
         f"routes at {gatewayctl.api_base()}/gateway/routes"
@@ -1208,6 +1396,19 @@ def gateway_status() -> None:
         table.add_row(r["model"], ", ".join(r["tasks"]), r["profile"], r["url"])
     console.print(table)
     console.print(f"[dim]tracked jobs: {snap['tracked_jobs']}[/dim]")
+
+
+@gateway_app.command("logs")
+def gateway_logs(lines: int = typer.Option(100, "-n", help="Journal lines to fetch")) -> None:
+    """The gateway's journal — routing refusals, vanished jobs, unreachable
+    fleets, ambiguous owner probes.
+
+    This is where "the customer's job disappeared" is answered: the gateway
+    decides which fleet holds every id.
+    """
+    from . import gatewayctl
+
+    console.print(gatewayctl.logs(lines) or "[dim]no output[/dim]")
 
 
 fleet_app = typer.Typer(help="Fleet composition: which models share the machine")
@@ -1252,7 +1453,7 @@ def fleet_status_cmd() -> None:
         # SystemExit too: a profile with no balancer port declared (a CPU
         # model, say) raises it from the registry, and status must describe
         # such deployments rather than die on them.
-        with contextlib.suppress(Exception, SystemExit):
+        with contextlib.suppress(Exception):
             membership[profile] = {
                 b["url"]: b for b in balancerctl.stats(profile).get("backends", [])
             }
@@ -1270,7 +1471,7 @@ def fleet_status_cmd() -> None:
     console.print(table)
     # Which declared mix, if any, matches what is running?
     for path in sorted(fleet_mod.FLEETS_DIR.glob("*.toml")):
-        with contextlib.suppress(Exception, SystemExit):
+        with contextlib.suppress(Exception):
             f = fleet_mod.load(path.stem)
             d = fleet_mod.delta(
                 fleet_mod.plan(f, releasing_extra={c.profile for c in claims}),
@@ -1549,12 +1750,30 @@ def batch_run(
         help="Optional per-item hard cap, seconds (0 = none; stuck items "
         "are detected from server evidence instead)",
     ),
+    fetch_existing: bool = typer.Option(
+        False,
+        "--fetch-existing",
+        help="Collect ONLY: adopt and download items that already own a "
+        "server job, submit NOTHING new, then stop. Pending items stay "
+        "pending for a later run.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show exactly what this run would do — what it skips as an "
+        "existing duplicate, what it adopts, what it would submit — and "
+        "exit without contacting a GPU.",
+    ),
 ) -> None:
     """Generate every prompt in a file, resumably, keeping the fleet busy.
 
     Ctrl-C stops CLEANLY: in-flight jobs keep running server-side, their ids
     are already on disk, and re-running the same command re-attaches to them
     instead of duplicating.
+
+    --fetch-existing winds a batch down instead of continuing it: the
+    in-flight tail is harvested, the backlog is left parked, and the fleet
+    receives no new work.
     """
     from . import balancerctl
     from . import batch as batch_mod
@@ -1563,9 +1782,31 @@ def batch_run(
     path = Path(prompts)
     label = name or path.stem
     existing = batch_mod.Batch.load(label) if resume else None
+    if fetch_existing and existing is None:
+        raise SystemExit(
+            f"no batch state named {label!r} — --fetch-existing collects "
+            f"jobs an earlier run already submitted, so it needs that "
+            f"run's state (see `deepme batch list`)"
+        )
     if existing:
         batch = existing
-        console.print(f"[dim]resuming batch {label!r}: {batch.counts()}[/dim]")
+        # RECONCILE against the file. Taking the saved state and discarding
+        # the file meant a resume ran the OLD prompts with their OLD job
+        # ids — and an item with a job id is ADOPTED, not generated, so the
+        # old video was delivered as the new prompt's output.
+        try:
+            merged = batch_mod.merge_items(existing.items, batch_mod.load_items(path))
+        except batch_mod.PromptsChanged as exc:
+            raise SystemExit(f"{path} does not match batch {label!r}: {exc}") from None
+        added = len(merged) - len(existing.items)
+        batch.items = merged
+        if added:
+            batch.save()
+        console.print(
+            f"[dim]resuming batch {label!r}: {batch.counts()}"
+            + (f" (+{added} new from {path.name})" if added else "")
+            + "[/dim]"
+        )
     else:
         batch = batch_mod.Batch(
             name=label,
@@ -1573,6 +1814,10 @@ def batch_run(
             items=batch_mod.load_items(path),
             out_dir=str(Path(out) if out else batch_mod.BATCH_DIR / label / "clips"),
         )
+
+    if dry_run:
+        _batch_dry_run(batch, fetch_existing=fetch_existing)
+        return
 
     target, via = front_end(spec, direct=direct)
     # One in flight per replica: more just queues INSIDE an engine, where the
@@ -1586,19 +1831,37 @@ def batch_run(
         mean = sum(means) / len(means) if means else 0.0
     workers = concurrency or replicas
 
-    pending = len(batch.todo())
-    est = batch_mod.estimate(pending, workers, mean)
-    console.print(
-        f"{_stamp()} {pending} item(s) via {via}, {workers} in flight"
-        + (
-            f" — ~{est['hours']:.1f}h at {est['per_hour']:.1f}/hour "
-            f"(~{est['overnight_10h']:.0f} in a 10h night)"
-            if mean
-            else " — no timing history yet, so no estimate"
+    if fetch_existing:
+        # Adoptable = owns a server job (running, or failed on a cut
+        # download that reconciliation will retry). Counted here only for
+        # the banner; batch.run applies the same rule authoritatively.
+        adoptable = [i for i in batch.items if i.job_id and i.status in ("running", "failed")]
+        parked = sum(
+            1
+            for i in batch.items
+            if i.status == "pending" or (i.status == "running" and not i.job_id)
         )
-    )
+        pending = len(adoptable)
+        console.print(
+            f"{_stamp()} fetch-existing: adopting {len(adoptable)} job(s) "
+            f"via {via}, submitting nothing — "
+            f"{parked} item(s) stay parked for a later run"
+        )
+    else:
+        pending = len(batch.todo())
+        est = batch_mod.estimate(pending, workers, mean)
+        console.print(
+            f"{_stamp()} {pending} item(s) via {via}, {workers} in flight"
+            + (
+                f" — ~{est['hours']:.1f}h at {est['per_hour']:.1f}/hour "
+                f"(~{est['overnight_10h']:.0f} in a 10h night)"
+                if mean
+                else " — no timing history yet, so no estimate"
+            )
+        )
 
     done = {"n": 0}
+    done_counter = itertools.count(1)
     from rich.progress import (
         BarColumn,
         Progress,
@@ -1651,7 +1914,11 @@ def batch_run(
         )
 
     def report(item, b) -> None:
-        done["n"] += 1
+        # next() on a shared count is atomic; `done["n"] += 1` is
+        # load/add/store and is called from every worker OUTSIDE the batch
+        # lock, so simultaneous completions lost counts — under-reporting
+        # progress and permanently inflating the remaining-time estimate.
+        done["n"] = next(done_counter)
         task = tasks.pop(item.index, None)
         if task is not None:
             progress.remove_task(task)
@@ -1680,11 +1947,14 @@ def batch_run(
                 on_start=started,
                 on_tick=ticked,
                 on_done=report,
+                fetch_only=fetch_existing,
             )
-    except KeyboardInterrupt:
-        # A summary and a way forward, never a stack trace. The in-flight
-        # jobs keep running SERVER-side with their ids on disk; the same
-        # command re-attaches to them.
+    except (KeyboardInterrupt, SystemExit):
+        # BOTH stages of the interrupt protocol. Naming only
+        # KeyboardInterrupt meant a second ^C — which the escalation banner
+        # actively invites — skipped this entire block, so the operator
+        # lost the re-attach list and the ledger entry for an interrupted
+        # overnight run: the single most important output there is.
         counts = batch.counts()
         attached = [i for i in batch.items if i.status == "running" and i.job_id]
         console.print(
@@ -1712,6 +1982,326 @@ def batch_run(
         f"\n[green]{counts['done']}[/green] done, "
         f"[red]{counts['failed']}[/red] failed — {batch.out_dir}"
     )
+    if fetch_existing and counts["pending"]:
+        console.print(
+            f"[dim]{counts['pending']} item(s) still parked — resume "
+            f"submissions with: uv run deepme batch run {prompts} "
+            f"-m {spec.profile} --name {batch.name}[/dim]"
+        )
+    if counts["failed"]:
+        # NON-ZERO on failures. Exiting 0 with failed items meant an
+        # overnight `batch run && publish` could not tell a clean night from
+        # a half-failed one — the same rule `bench` and `ports` already
+        # follow. The re-run command is on screen, so this is actionable.
+        console.print(
+            f"[dim]retry them with: uv run deepme batch run {prompts} "
+            f"-m {spec.profile} --name {batch.name}[/dim]"
+        )
+        raise typer.Exit(1)
+
+
+def _print_spec_census(census, *, full: bool) -> None:
+    """The GPU verdict: what to never run again, in a dozen lines. The raw
+    group-by-group listing only appears with --full."""
+    from . import reconcile
+
+    if not census:
+        return
+    if full:
+        console.print(
+            f"\n[bold]{len(census)} identical-request group(s)[/bold] across "
+            f"batches (same prompt+seed+params):"
+        )
+        for g in census:
+            seed = f"seed {g.seed}" if g.deterministic else "[yellow]no seed[/yellow]"
+            note = "" if g.deterministic else " — reruns produce DIFFERENT bytes"
+            who = ", ".join(f"{m.batch}[{m.index:04d} {m.status}]" for m in g.members)
+            console.print(f"  {len(g.members)}x  {seed}  {_safe(g.prompt[:48])!r}{note}")
+            console.print(f"      [dim]{who}[/dim]")
+
+    s = reconcile.summarize_census(census)
+    console.print(f"\n[bold]GPU verdict[/bold] ({len(census)} identical-request group(s)):")
+    if s.already_generated:
+        console.print(
+            f"  [red]NEVER RUN[/red] {len(s.already_generated)} pending item(s): "
+            f"seeded twins of content that ALREADY EXISTS — running them "
+            f"recreates identical bytes:"
+        )
+        for name, idxs in s.by_batch(s.already_generated).items():
+            console.print(f"    {name}: " + ", ".join(f"{i:04d}" for i in idxs))
+    if s.redundant:
+        console.print(
+            f"  [yellow]RUN ONE PER SET[/yellow] — {len(s.redundant)} pending "
+            f"item(s) are seeded twins of another pending item; only one of "
+            f"each set is real work:"
+        )
+        for name, idxs in s.by_batch(s.redundant).items():
+            console.print(
+                f"    {name}: " + ", ".join(f"{i:04d}" for i in idxs) + "  (the skippable side)"
+            )
+    if s.seedless:
+        console.print(
+            f"  [cyan]YOUR CALL[/cyan] — {len(s.seedless)} pending item(s) repeat "
+            f"a request WITHOUT a seed (each run differs; duplicates of "
+            f"intent, not of content):"
+        )
+        for name, idxs in s.by_batch(s.seedless).items():
+            console.print(f"    {name}: " + ", ".join(f"{i:04d}" for i in idxs))
+    if not (s.already_generated or s.redundant or s.seedless):
+        console.print("  [green]none pending[/green] — every pending item is unique work.")
+    if not full:
+        console.print("  [dim](--full lists every group with prompts and seeds)[/dim]")
+
+
+@batch_app.command("journal")
+def batch_journal(
+    name: str = typer.Argument(..., help="Batch name"),
+    item: int = typer.Option(None, "--item", help="Only this item index"),
+    lines: int = typer.Option(200, "-n", help="Most recent entries to show"),
+) -> None:
+    """The append-only history of a batch: every job id an item ever held,
+    every retry, every delivered file and its MD5.
+
+    state.json is only CURRENT state — a resubmit overwrites job_id — so
+    this is the only record that can answer "which server job produced the
+    file sitting in slot N, and are those bytes the ones it delivered".
+    """
+    from . import batch as batch_mod
+
+    path = batch_mod.BATCH_DIR / name / "journal.jsonl"
+    if not path.exists():
+        raise SystemExit(
+            f"no journal for {name!r} at {path} — batches run before "
+            f"journalling was added have none (see `deepme batch list`)"
+        )
+    rows = []
+    for raw in path.read_text().splitlines():
+        with contextlib.suppress(ValueError):
+            rec = json.loads(raw)
+            if item is None or int(rec.get("item", -1)) == item:
+                rows.append(rec)
+    if not rows:
+        console.print(f"no entries{'' if item is None else f' for item {item:04d}'}")
+        return
+    table = Table(box=None, pad_edge=False)
+    for col in ("when", "item", "event", "detail"):
+        table.add_column(col, overflow="fold")
+    for rec in rows[-lines:]:
+        detail = " ".join(
+            f"{k}={v}"
+            for k, v in rec.items()
+            if k not in ("ts", "item", "event") and v not in (None, "")
+        )
+        idx = rec.get("item")
+        table.add_row(
+            str(rec.get("ts", ""))[:19],
+            f"{int(idx):04d}" if isinstance(idx, int) else "-",
+            str(rec.get("event", "")),
+            _safe(detail[:160]),
+        )
+    console.print(table)
+    console.print(f"[dim]{len(rows)} entry(ies) · {path}[/dim]")
+
+
+@batch_app.command("audit")
+def batch_audit(
+    name: str = typer.Option(None, help="One batch (default: every batch on disk)"),
+) -> None:
+    """Find items whose delivered content may not be their own.
+
+    Answers the misattribution question from records already on disk:
+    items that a resume would ADOPT instead of generating, items sharing
+    one server job, prompts that changed under an index-matched batch, and
+    done-but-missing files.
+    """
+    from . import reconcile
+
+    batches = reconcile.load_batches()
+    if name:
+        batches = [b for b in batches if b.name == name]
+        if not batches:
+            raise SystemExit(f"no batch named {name!r} — see `deepme batch list`")
+    found = [s for b in batches for s in reconcile.audit_batch(b)]
+    bad = reconcile.unreadable_batches()
+    if bad:
+        console.print(f"[red]unreadable state[/red]: {', '.join(bad)}")
+    if not found:
+        console.print(f"{len(batches)} batch(es) checked — nothing suspicious.")
+        return
+    table = Table(box=None, pad_edge=False)
+    for col in ("batch", "item", "finding", "detail"):
+        table.add_column(col, overflow="fold")
+    for s in found:
+        colour = (
+            "red" if s.kind in ("stale-adoption", "shared-job-id", "prompt-drift") else "yellow"
+        )
+        table.add_row(s.batch, f"{s.index:04d}", f"[{colour}]{s.kind}[/{colour}]", s.detail)
+    console.print(table)
+    counts: dict[str, int] = {}
+    for s in found:
+        counts[s.kind] = counts.get(s.kind, 0) + 1
+    console.print(
+        "\n" + " · ".join(f"{k}: {v}" for k, v in sorted(counts.items())) + f" — {len(found)} total"
+    )
+    raise typer.Exit(1)
+
+
+@batch_app.command("dedupe")
+def batch_dedupe(
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Actually delete and reset. Without it: full dry run, no changes.",
+    ),
+    extra: list[str] = typer.Option(
+        [], "--dir", help="Additional clip directories to include (repeatable)"
+    ),
+    full: bool = typer.Option(
+        False, "--full", help="Also list every identical-request group in detail"
+    ),
+) -> None:
+    """Incident repair: hash every clip, keep only the OLDEST copy of any
+    byte-identical content, delete the newer copies, and reset their items
+    to pending with job ids CLEARED so re-running regenerates from the
+    prompt — never re-adopts the wrong server job.
+
+    Dry run by default; nothing is touched until --apply.
+    """
+    from . import reconcile
+
+    batches = reconcile.load_batches()
+    dirs, owners = reconcile.batch_clip_index(batches)
+    dirs.extend(Path(d) for d in extra)
+    console.print(f"[dim]hashing clips in {len(dirs)} director(ies)…[/dim]")
+    plan = reconcile.build_plan(reconcile.scan_dirs(dirs), owners)
+    _print_spec_census(reconcile.spec_census(batches), full=full)
+
+    if not plan.groups:
+        console.print(f"scanned {plan.scanned} clip(s) — no duplicated content. Nothing to do.")
+        return
+    table = Table(box=None, pad_edge=False)
+    for col in ("content", "keep (oldest)", "delete (newer copies)"):
+        table.add_column(col, overflow="fold")
+    for g in plan.groups:
+        table.add_row(g.digest[:10], str(g.keep), "\n".join(str(p) for p in g.drop))
+    console.print(table)
+    console.print(
+        f"\nscanned {plan.scanned} clip(s): {len(plan.groups)} duplicated "
+        f"content group(s), {len(plan.drops)} file(s) to delete, "
+        f"{len(plan.skips)} item(s) -> SKIPPED (their output is the kept "
+        f"copy; they will NEVER regenerate), {len(plan.resets)} item(s) -> "
+        f"pending (different request, so the file was never their output)"
+    )
+    for name, index, path, keeper in sorted(plan.skips):
+        console.print(
+            f"  [green]skip[/green] {name}[{index:04d}] — deletes {path}, [dim]keeps {keeper}[/dim]"
+        )
+    for name, index, path in sorted(plan.resets):
+        console.print(f"  [yellow]reset[/yellow] {name}[{index:04d}] — loses {path}")
+
+    # The operator's next move, aggregated: which batches need a re-run,
+    # which items each regenerates, and the exact commands — no manual
+    # cross-comparison of fifty scattered reset lines.
+    by_batch: dict[str, list[int]] = {}
+    for name, index, _path in plan.resets:
+        by_batch.setdefault(name, []).append(index)
+    if by_batch:
+        console.print("\nresets by batch:")
+        for name in sorted(by_batch):
+            idxs = sorted(by_batch[name])
+            console.print(f"  {name}  {len(idxs)} item(s): " + ", ".join(f"{i:04d}" for i in idxs))
+        console.print("\nre-run these after --apply (resumes regenerate only the resets):")
+        from . import batch as batch_mod
+
+        for name in sorted(by_batch):
+            b = batch_mod.Batch.load(name)
+            prof = b.profile if b else "<profile>"
+            console.print(f"  uv run deepme batch run {name}.jsonl -m {prof} --name {name}")
+    if not apply:
+        console.print(
+            "\n[yellow]dry run[/yellow] — nothing was changed. "
+            "Re-run with --apply to execute, then run the commands above."
+        )
+        return
+    deleted, reset = reconcile.apply_plan(plan)
+    runs.record(
+        "batch-dedupe",
+        None,
+        outcome="ok",
+        detail={
+            "deleted": deleted,
+            "reset": reset,
+            "groups": len(plan.groups),
+            "batches": {k: sorted(v) for k, v in by_batch.items()},
+        },
+    )
+    console.print(
+        f"\n[green]done[/green]: deleted {deleted} file(s), reset {reset} "
+        f"item(s) across {len(by_batch)} batch(es). Run the commands above "
+        f"to regenerate."
+    )
+
+
+@batch_app.command("fixup")
+def batch_fixup(
+    apply: bool = typer.Option(False, "--apply", help="Write the skips. Without it: full dry run."),
+    skip_seedless: bool = typer.Option(
+        False,
+        "--skip-seedless",
+        help="Also skip seedless duplicate requests (same prompt, no seed — "
+        "each run differs, so this is an intent decision)",
+    ),
+) -> None:
+    """Make the GPU verdict executable: mark every duplicate generation
+    SKIPPED in its batch state, so `batch run` only ever runs unique work.
+
+    Skipped items carry their reason ("twin of generated longer2[0019]"),
+    are journaled, and show in `batch list` — no invisible backlog. Then
+    just re-run your batches: nothing duplicated will generate.
+    """
+    from . import batch as batch_mod
+    from . import reconcile
+
+    batches = reconcile.load_batches()
+    summary = reconcile.summarize_census(reconcile.spec_census(batches))
+    targets = list(summary.already_generated) + list(summary.redundant)
+    if skip_seedless:
+        targets += list(summary.seedless)
+    if not targets:
+        console.print("nothing to fix up — every pending item is unique work.")
+        return
+    for m in sorted(targets, key=lambda m: (m.batch, m.index)):
+        reason = summary.sources.get((m.batch, m.index), "duplicate request")
+        console.print(f"  skip {m.batch}[{m.index:04d}] — {reason}")
+    if summary.seedless and not skip_seedless:
+        console.print(
+            f"  [dim]{len(summary.seedless)} seedless duplicate request(s) left "
+            f"alone (--skip-seedless to include them)[/dim]"
+        )
+    if not apply:
+        console.print(
+            f"\n[yellow]dry run[/yellow] — {len(targets)} item(s) would be "
+            f"skipped. Re-run with --apply."
+        )
+        return
+    skipped = reconcile.apply_fixup(summary, skip_seedless=skip_seedless)
+    runs.record("batch-fixup", None, outcome="ok", detail={"skipped": skipped})
+    console.print(f"\n[green]done[/green]: {sum(skipped.values())} item(s) skipped.")
+    console.print("remaining unique work per batch:")
+    for name in sorted(skipped):
+        b = batch_mod.Batch.load(name)
+        if b is None:
+            continue
+        c = b.counts()
+        left = c["pending"] + c["running"]
+        console.print(
+            f"  {name}: {left} to run, {c['skipped']} skipped, {c['done']} done"
+            + (
+                f" — uv run deepme batch run {name}.jsonl -m {b.profile} --name {name}"
+                if left
+                else ""
+            )
+        )
 
 
 @batch_app.command("list")
@@ -1724,7 +2314,7 @@ def batch_list() -> None:
         console.print(f"no batches under {batch_mod.BATCH_DIR}")
         return
     table = Table(box=None, pad_edge=False)
-    for col in ("batch", "profile", "done", "failed", "pending", "running"):
+    for col in ("batch", "profile", "done", "failed", "pending", "skipped", "running"):
         table.add_column(col)
     for path in rows:
         b = None
@@ -1733,7 +2323,7 @@ def batch_list() -> None:
         if b is None:
             # A row that cannot load is still a fact worth showing — a
             # silently skipped batch reads as "does not exist".
-            table.add_row(path.parent.name, "[red]unreadable state[/red]", "-", "-", "-", "-")
+            table.add_row(path.parent.name, "[red]unreadable state[/red]", "-", "-", "-", "-", "-")
             continue
         c = b.counts()
         table.add_row(
@@ -1742,13 +2332,17 @@ def batch_list() -> None:
             str(c["done"]),
             str(c["failed"]),
             str(c["pending"]),
+            str(c["skipped"]),
             str(c["running"]),
         )
     console.print(table)
 
 
 @batch_app.command("status")
-def batch_status(name: str = typer.Argument(..., help="Batch name")) -> None:
+def batch_status(
+    name: str = typer.Argument(..., help="Batch name"),
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable, for scripts"),
+) -> None:
     """Progress of a batch — safe to run while it is going."""
     from . import batch as batch_mod
 
@@ -1756,6 +2350,33 @@ def batch_status(name: str = typer.Argument(..., help="Batch name")) -> None:
     if batch is None:
         raise SystemExit(f"no batch named {name!r} — see `deepme batch list`")
     counts = batch.counts()
+    if as_json:
+        # Every item with its identity and outcome: the shape an overnight
+        # watchdog needs to decide whether to page someone.
+        console.print_json(
+            json.dumps(
+                {
+                    "name": batch.name,
+                    "profile": batch.profile,
+                    "out_dir": batch.out_dir,
+                    "counts": counts,
+                    "items": [
+                        {
+                            "index": i.index,
+                            "status": i.status,
+                            "job_id": i.job_id,
+                            "file": i.file,
+                            "took_s": round(i.took_s, 1),
+                            "started_at": i.started_at,
+                            "error": str(i.error) if i.error else None,
+                        }
+                        for i in batch.items
+                        if i.status != batch_mod.PENDING
+                    ],
+                }
+            )
+        )
+        return
     console.print(f"[bold]{name}[/bold] ({batch.profile}) -> {batch.out_dir}")
     console.print(
         f"done={counts['done']} failed={counts['failed']} "
@@ -1770,14 +2391,31 @@ def batch_status(name: str = typer.Argument(..., help="Batch name")) -> None:
     # in the state file with nothing on the server is exactly the stall that
     # burned an overnight run — make it visible from any shell.
     on_server: set[str] = set()
+    queued_tickets: set[str] = set()
     server_ok = False
+    queue_ok = False
+    with contextlib.suppress(Exception):
+        from . import gatewayctl, media
+
+        # ONE parser, shared with the stall verdict. A fleet that could not
+        # be asked reports NO running list, and reading its silence as "these
+        # jobs are gone" printed "NOT on server" for every healthy item on
+        # it. `complete` is the trust bit — it is false for an unreachable
+        # fleet AND for a reachable one that reported no running list at all,
+        # which the check written here missed.
+        view = media.capacity_view(gatewayctl.capacity())
+        server_ok = view.complete
+        on_server.update(view.running)
+    # The QUEUE too. Checking only the running set meant a `q_` ticket
+    # destroyed by a balancer restart — the one state where a batch is
+    # silently dead — was reported as a confident "queued".
     with contextlib.suppress(Exception):
         from . import gatewayctl
 
-        cap = gatewayctl.capacity()
-        for f in cap.get("fleets", []):
-            on_server.update(str(j.get("job_id")) for j in f.get("running", []))
-        server_ok = True
+        qfleets = gatewayctl.queue().get("fleets", [])
+        queue_ok = bool(qfleets) and all(f.get("reachable", True) for f in qfleets)
+        for f in qfleets:
+            queued_tickets.update(str(t.get("ticket")) for t in f.get("next", []))
     for item in batch.items:
         if item.status == "running":
             elapsed = _time.time() - item.started_at if item.started_at else None
@@ -1786,12 +2424,16 @@ def batch_status(name: str = typer.Argument(..., help="Batch name")) -> None:
                 where = "[dim]server unreachable[/dim]"
             elif item.job_id and item.job_id in on_server:
                 where = "[green]generating[/green]"
+            elif item.job_id and item.job_id.startswith("q_"):
+                # A ticket lives in balancer MEMORY: a restart destroys it,
+                # and reporting that as "queued" hid the one state where an
+                # overnight batch is silently dead.
+                if queue_ok and item.job_id not in queued_tickets:
+                    where = "[red]TICKET GONE — re-run to resubmit[/red]"
+                else:
+                    where = "[yellow]queued[/yellow]"
             elif item.job_id:
-                where = (
-                    "[yellow]queued[/yellow]"
-                    if item.job_id.startswith("q_")
-                    else "[red]NOT on server[/red]"
-                )
+                where = "[red]NOT on server[/red]"
             else:
                 where = "[red]never submitted[/red]"
             console.print(
@@ -1891,6 +2533,10 @@ def showcase_run(
         f"\n[green]{len(ok)}/{len(results)}[/green] clips in {gallery} "
         f"(manifest.json records prompts, seeds and timings)"
     )
+    if len(ok) != len(results):
+        # A partial reel is not a success: exit non-zero so a scripted
+        # `showcase run && publish` stops here.
+        raise typer.Exit(1)
 
 
 store_app = typer.Typer(help="Shared weight store (/dev/shm) — usage and cleanup")
@@ -2068,7 +2714,7 @@ def plan(
                 continue
             try:
                 spec = profiles.load(name)
-            except (Exception, SystemExit):
+            except Exception:
                 continue
             candidates.append((name, spec.weight_gib, spec.attn_heads, spec))
 
@@ -2436,12 +3082,25 @@ def _assert_profile_drained(spec, *, force: bool) -> None:
     if force:
         return
     busy = waiting = 0
+    probed = False
     # Probe inside the suppress; VERDICT outside it — a raise inside its own
     # suppress block is a guard that never fires.
-    with contextlib.suppress(Exception, SystemExit):
+    with contextlib.suppress(Exception):
         snap = balancerctl.stats(spec.profile)
         busy = sum(b.get("inflight", 0) for b in snap.get("backends", []))
         waiting = int(balancerctl.queue(spec.profile).get("waiting") or 0)
+        probed = True
+    if not probed:
+        # NO ANSWER IS NOT "NOTHING RUNNING". The counters start at zero, so
+        # an unreachable or crash-looping balancer silently satisfied this
+        # guard and the stop went through into live generations — the same
+        # trap `reboot` refuses on.
+        raise SystemExit(
+            f"cannot ask {spec.profile}'s balancer what it is running "
+            f"(unreachable). Stopping blind can kill paying work — retry, "
+            f"check `deepme balancer status -m {spec.profile}`, or pass "
+            f"--force."
+        )
     if busy or waiting:
         raise SystemExit(
             f"{spec.profile} has {busy} running job(s) and {waiting} "
@@ -2633,8 +3292,19 @@ def _safe(text: object) -> str:
     return escape(str(text))
 
 
-def front_end(spec, *, direct: bool = False):
-    """Where a request should go, most capable front end first.
+def front_end(spec, *, direct: bool = False, task: str | None = None, check: bool = True):
+    """Where a request should go — and whether it can go anywhere at all.
+
+    The checks live HERE, not at call sites, because this is already the one
+    function every generation path calls to resolve its destination. Asking
+    each command to remember two extra guards is how `story`, `showcase` and
+    `batch` came to have no model-kind check at all: the policy existed, and
+    three callers silently opted out of it by not knowing. A new command now
+    gets both checks by construction, and `check=False` is the single visible
+    way to opt out (used by read-only callers like job-progress, which
+    resolve an address without submitting anything).
+
+    Most capable front end first.
 
     Three layers can serve a request, and each one below adds a failure mode
     the caller would otherwise have to handle:
@@ -2653,8 +3323,14 @@ def front_end(spec, *, direct: bool = False):
 
     from . import balancerctl, gatewayctl
 
+    if check:
+        assert_diffusion(spec)
     if direct:
+        # --direct bypasses the balancer on purpose, so fleet-level capacity
+        # says nothing about whether THIS replica can serve it.
         return spec, "replica directly"
+    if check:
+        assert_servable(spec, task)
     try:
         # Only via the gateway if it knows this model — otherwise it would
         # refuse with a 400 that the balancer would have served fine.
@@ -2677,6 +3353,158 @@ def front_end(spec, *, direct: bool = False):
     except Exception:
         return spec, "replica directly (no balancer running)"
     return spec, "replica directly (balancer has no replicas)"
+
+
+def assert_diffusion(spec) -> None:
+    """Refuse a text profile before anything else happens.
+
+    One global default (`[model] default`) is shared by text and diffusion
+    commands, which accept disjoint sets of profiles — so a bare `generate`
+    inherits whatever `switch` last selected. When that is an LLM the request
+    is structurally impossible, and the old message said only "use a different
+    command", never which profile to use. Batch and story skipped this check
+    entirely, so an overnight run could be pointed at a text model and fail
+    per item, all night.
+    """
+    from . import engines as engines_mod
+    from . import profiles
+
+    if spec.kind == engines_mod.KIND_DIFFUSION:
+        return
+    usable = [n for n in profiles.diffusion_profiles() if n != spec.profile]
+    hint = f" — try {' or '.join(f'-m {n}' for n in usable)}" if usable else ""
+    raise SystemExit(
+        f"profile {spec.profile!r} is a {spec.kind} model and cannot generate "
+        f"video{hint}. (`deepme model use` sets ONE default shared with the "
+        f"text commands; pass -m explicitly for video.)"
+    )
+
+
+def assert_servable(spec, task: str | None = None) -> None:
+    """Refuse before submitting when nothing can serve this.
+
+    NO ANSWER IS NOT "IT IS FINE" — the same rule `_assert_profile_drained`
+    enforces. `front_end` degrades silently by design (a partial deployment
+    should still work), so a completely dead fleet used to print "generating…
+    via replica directly" and then post into the void, surfacing minutes later
+    as an HTTP error from whatever else happened to be on that port. Worse,
+    a submission the balancer ACCEPTS while no replica is healthy becomes a
+    queue ticket, and a queued ticket is deliberately exempt from every
+    client-side stall verdict — so the caller waits forever, correctly.
+
+    The evidence is already published: /v1/capacity carries healthy,
+    accepting_replicas and the task list per fleet. This just reads it.
+    """
+    from . import gatewayctl, media
+
+    try:
+        view = media.capacity_view(gatewayctl.capacity(), spec.profile)
+    except Exception as exc:
+        raise SystemExit(
+            f"cannot ask the platform whether {spec.profile!r} can serve this "
+            f"({exc}) — check `deepme capacity`, `deepme gateway status` or "
+            f"`deepme balancer status -m {spec.profile}`. Refusing to submit "
+            f"work that nothing may be able to run."
+        ) from None
+    if not view.complete:
+        raise SystemExit(
+            f"no reachable fleet serves {spec.profile!r} right now — check "
+            f"`deepme capacity` and `deepme fleet status`. Refusing to submit: "
+            f"a fleet that cannot be asked may not exist, and the queue would "
+            f"hold this indefinitely."
+        )
+    if not view.accepting_replicas:
+        raise SystemExit(
+            f"{spec.profile!r} has {view.replicas} replica(s) attached but NONE "
+            f"accepting work (unhealthy or draining) — `deepme balancer status "
+            f"-m {spec.profile}`. Submitting now would queue behind a fleet "
+            f"that cannot start it."
+        )
+    if task and view.tasks and task not in view.tasks:
+        raise SystemExit(
+            f"{spec.profile!r} serves {', '.join(sorted(view.tasks))} — not "
+            f"{task!r}. See the conditioning-mode table in docs/USER-GUIDE.md; "
+            f"ref2va needs the h3-ref deployment."
+        )
+
+
+def _batch_dry_run(batch, *, fetch_existing: bool) -> None:
+    """What this run would do, without contacting a GPU.
+
+    A wrong batch costs twenty minutes of generation before the mistake is
+    even visible, so the expensive decisions — what gets skipped as an
+    existing duplicate, what gets adopted, what actually gets submitted —
+    have to be inspectable before any of it starts.
+
+    Computed with the SAME functions the real run uses (batch.skip_existing,
+    the same status rules), against a COPY of the state, so what is printed
+    is what would happen rather than a second implementation of it.
+    """
+    import copy
+
+    from . import reconcile
+
+    preview = copy.deepcopy(batch)
+    would_skip = [] if fetch_existing else _preview_skips(preview)
+
+    adopt = [
+        i
+        for i in preview.items
+        if i.job_id and i.status in ("running", "failed") and not i.job_id.startswith("q_")
+    ]
+    tickets = [i for i in preview.items if i.job_id and i.job_id.startswith("q_")]
+    submit = (
+        [i for i in preview.items if i.status == batch_mod.PENDING] if not fetch_existing else []
+    )
+    done = [i for i in preview.items if i.status == batch_mod.DONE]
+    already_skipped = [
+        i for i in preview.items if i.status == batch_mod.SKIPPED and i not in would_skip
+    ]
+
+    console.print(f"\n[bold]dry run — {batch.name}[/bold] (nothing was submitted)\n")
+    table = Table(box=None, pad_edge=False)
+    for col in ("action", "items", "meaning"):
+        table.add_column(col, overflow="fold")
+    table.add_row("[green]keep[/green]", str(len(done)), "already generated, untouched")
+    table.add_row(
+        "[green]skip (new)[/green]",
+        str(len(would_skip)),
+        "identical request already generated — WILL NOT be regenerated",
+    )
+    table.add_row(
+        "[dim]skip (recorded)[/dim]", str(len(already_skipped)), "previously marked duplicate"
+    )
+    table.add_row("[cyan]adopt[/cyan]", str(len(adopt)), "already on a GPU — poll and download")
+    table.add_row("[dim]tickets[/dim]", str(len(tickets)), "queued server-side, left alone")
+    table.add_row(
+        "[yellow]SUBMIT[/yellow]",
+        str(len(submit)),
+        "NEW generations — this is the GPU time this run would spend",
+    )
+    console.print(table)
+
+    for i in would_skip[:20]:
+        console.print(f"  [green]skip[/green] {batch.name}[{i.index:04d}] — {i.error}")
+    if len(would_skip) > 20:
+        console.print(f"  [dim]… and {len(would_skip) - 20} more[/dim]")
+    for i in submit[:20]:
+        console.print(f"  [yellow]submit[/yellow] {batch.name}[{i.index:04d}] — {i.prompt[:70]}…")
+    if len(submit) > 20:
+        console.print(f"  [dim]… and {len(submit) - 20} more[/dim]")
+
+    if not submit and not adopt:
+        console.print("\n[dim]nothing to do — no GPU time would be spent.[/dim]")
+    console.print(
+        f"\n[dim]re-run without --dry-run to execute. "
+        f"{len(reconcile.load_batches())} batch(es) were consulted for duplicates.[/dim]"
+    )
+
+
+def _preview_skips(preview) -> list:
+    """Items skip_existing WOULD mark, computed on a throwaway copy."""
+    before = {i.index: i.status for i in preview.items}
+    batch_mod.skip_existing(preview)
+    return [i for i in preview.items if before[i.index] != i.status]
 
 
 def _batch_age(batch) -> str:
@@ -2717,8 +3545,19 @@ def _tick_fields(tick) -> dict:
         # pre-stage signal, and "starting" for a ticket 3-deep in the queue
         # hid the difference between waiting and wedged.
         pos = getattr(tick, "queue_position", None)
+        # "starting" claims we began something. For an ADOPTED job — one
+        # already running server-side, which is every item in a collect-only
+        # run — that read as the tool launching new work, and it is the
+        # opposite of true. Say what is actually happening: we are attached
+        # and have not yet scraped a stage.
+        if pos:
+            label = f"queued #{pos}"
+        elif getattr(tick, "adopted", False):
+            label = "attached (awaiting stage)"
+        else:
+            label = "starting"
         return {
-            "description": (f"queued #{pos}" if pos else "starting"),
+            "description": label,
             "steps": "",
             "note": f"{_hms(tick.elapsed_s)} elapsed",
             "total": None,
@@ -2858,7 +3697,6 @@ def generate(
     ),
 ) -> None:
     """Generate a video from a diffusion model and save it locally."""
-    from . import engines as engines_mod
     from . import media
 
     extra: dict[str, object] = {}
@@ -2891,12 +3729,7 @@ def generate(
         extra["quality"] = quality
 
     spec = profiles.load(model)
-    if spec.kind != engines_mod.KIND_DIFFUSION:
-        raise SystemExit(
-            f"profile {spec.profile!r} is a {spec.kind} model — use `deepme test` "
-            "for text models; `generate` serves diffusion (image/video) models"
-        )
-    target, viawhat = front_end(spec, direct=direct)
+    target, viawhat = front_end(spec, direct=direct, task=str(extra.get("task") or "") or None)
     console.print(
         f"[dim]{_stamp()} generating {spec.served_name} via {viawhat} "
         f"({target.api_base}) — minutes, not seconds[/dim]"
@@ -2924,7 +3757,7 @@ def generate(
             )
     except media.StalledError as exc:
         raise SystemExit(str(exc)) from None
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         jid = submitted["id"]
         console.print(
             f"\n{_stamp()} interrupted — "
@@ -3577,3 +4410,18 @@ def main() -> None:
         # cleanly instead of dumping a stack trace.
         console.print("\ninterrupted")
         raise SystemExit(130) from None
+    except (media.MediaError, profiles.ProfileError, ports.PortsError, batch_mod.BatchBusy) as exc:
+        # THE boundary where a library failure becomes an exit code. These
+        # used to raise SystemExit themselves, from worker threads, where
+        # it exits nothing and merely impersonates an ordinary error that
+        # every caller then had to special-case. Every one of them is a
+        # one-line message with a next action, not a traceback.
+        console.print(f"[red]{_safe(str(exc))}[/red]")
+        raise SystemExit(1) from None
+    except BrokenPipeError:
+        # `deepme events --raw | head` is a designed use. Python flushes
+        # stdout at shutdown, so the pipe must be redirected before exit or
+        # the interpreter prints its own "Exception ignored" noise.
+        with contextlib.suppress(OSError):
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        raise SystemExit(0) from None

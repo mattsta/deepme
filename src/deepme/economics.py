@@ -99,6 +99,43 @@ class Config:
     default_steps: int = 49
 
 
+def expected_gpu_seconds(output_seconds: float | None, cfg: Config | None = None) -> float | None:
+    """Measured wall time for a clip of this duration, from the curve.
+
+    THE one evaluator of `[measured.duration]`. Duration scaling is
+    superlinear (a 15s clip measures ~5.7x a 4s clip), so a stall detector
+    comparing a long clip against a short-clip fleet mean executes healthy
+    work — this is the honest per-request baseline, and it lives here
+    beside the derivation that already owns what the curve means.
+
+    None when no measurements are configured. Segment selection is by
+    INDEX, never by comparing point values: duplicate measured points made
+    an interior pair compare equal to the last, extrapolating every large
+    input from the wrong segment.
+    """
+    if not output_seconds:
+        return None
+    cfg = cfg or load()
+    pts = sorted(
+        (float(p["seconds"]), float(p["gpu_seconds"]))
+        for p in cfg.duration_points
+        if float(p.get("seconds") or 0) > 0
+    )
+    if not pts:
+        return None
+    if len(pts) == 1:
+        x0, y0 = pts[0]
+        return y0 * (output_seconds / x0)
+    if output_seconds <= pts[0][0]:
+        return pts[0][1] * (output_seconds / pts[0][0])
+    for i in range(len(pts) - 1):
+        (x0, y0), (x1, y1) = pts[i], pts[i + 1]
+        # The last segment also carries extrapolation past the final point.
+        if output_seconds <= x1 or i == len(pts) - 2:
+            return y0 + (output_seconds - x0) / (x1 - x0) * (y1 - y0)
+    return pts[-1][1]
+
+
 def load(path: Path | None = None) -> Config:
     raw = tomllib.loads((path or ECONOMICS_FILE).read_text())
     server, market = raw["server"], raw["market"]
@@ -133,7 +170,13 @@ def derive(cfg: Config) -> Economics:
     # the per-output-second cost of the WORST legal duration exceeds the cost
     # measured on short clips. A floor derived from short clips alone would
     # lose money on long ones — scale it by the worst point on the curve.
-    per_out_s = [float(p["gpu_seconds"]) / float(p["seconds"]) for p in cfg.duration_points]
+    # `seconds > 0` guard: a zero-duration point is meaningless and would
+    # take down every pricing path, including the gateway's /v1/pricing.
+    per_out_s = [
+        float(p["gpu_seconds"]) / float(p["seconds"])
+        for p in cfg.duration_points
+        if float(p.get("seconds") or 0) > 0
+    ]
     duration_worst_ratio = max(per_out_s) / min(per_out_s) if per_out_s else 1.0
 
     tasks: dict[str, TaskEconomics] = {}

@@ -63,6 +63,8 @@ class FakeServer:
             )
             return _r(method, url, code, json=body)
         if path.endswith("/content"):
+            if method == "DELETE":  # the artifact ack
+                return _r(method, url, 200, json={"id": "vid_9", "reclaimed": 1})
             return _r(method, url, 200, content=b"MP4DATA")
         self.polls += 1
         if self.polls <= self.queue_polls:
@@ -109,6 +111,7 @@ def server(monkeypatch, tmp_path):
             return _Ctx()
 
     monkeypatch.setattr(httpx, "Client", _Client)
+    monkeypatch.setattr(httpx, "delete", lambda url, **kw: fake.handle("DELETE", url))
     return fake
 
 
@@ -140,6 +143,44 @@ def test_the_download_uses_the_harvested_job_id(server, tmp_path):
     assert "/v1/videos/vid_9/content" in server.paths
 
 
+def test_the_client_acks_only_after_the_file_is_durably_in_place(server, tmp_path):
+    """The ack is a promise: "this survives a power loss, you may reclaim
+    your copy". Sending it before the rename would let the server delete the
+    only good copy of a file we might still fail to place."""
+    seen: list[tuple[str, bool]] = []
+    real_delete = httpx.delete
+
+    def recording_delete(url, **kw):
+        # Was the final file already there when the ack went out?
+        seen.append((str(url), any(tmp_path.glob("*.mp4"))))
+        return real_delete(url, **kw)
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(httpx, "delete", recording_delete):
+        result = media.generate_video(_Spec(), "a lighthouse", out_dir=tmp_path)
+
+    assert len(seen) == 1, "exactly one ack per delivered artifact"
+    url, file_existed = seen[0]
+    assert url.endswith("/v1/videos/vid_9/content")
+    assert file_existed, "acked before the bytes were in place"
+    assert result.path and result.path.exists()
+
+
+def test_a_failed_ack_does_not_fail_the_download(server, tmp_path, monkeypatch):
+    """We already have the file. Cleanup is the server's housekeeping, and
+    losing the ack costs one artifact one retention window — it must never
+    turn a successful generation into a failure."""
+
+    def dead_ack(url, **kw):
+        raise httpx.ConnectError("ack went nowhere")
+
+    monkeypatch.setattr(httpx, "delete", dead_ack)
+    result = media.generate_video(_Spec(), "a lighthouse", out_dir=tmp_path)
+    assert result.status == "completed"
+    assert result.path and result.path.read_bytes() == b"MP4DATA"
+
+
 def test_a_job_accepted_immediately_skips_the_queue(server, tmp_path):
     result = media.generate_video(_Spec(), "a lighthouse", out_dir=tmp_path)
     assert result.media_id == "vid_9"
@@ -153,7 +194,7 @@ def test_a_rejected_submission_fails_loudly(monkeypatch, tmp_path):
         "post",
         lambda url, **kw: _r("POST", url, 400, json={"detail": "bad task"}),
     )
-    with pytest.raises(SystemExit, match="bad task"):
+    with pytest.raises(media.GenerationRejected, match="bad task"):
         media.generate_video(_Spec(), "x", out_dir=tmp_path)
 
 
@@ -200,7 +241,7 @@ def test_an_unfinished_job_reports_where_to_look(monkeypatch, tmp_path):
         "get",
         lambda url, **kw: _r("GET", url, 200, json={"status": "queued"}),
     )
-    with pytest.raises(SystemExit, match="may still"):
+    with pytest.raises(media.GenerationTimeout, match="may still"):
         media.generate_video(_Spec(), "x", out_dir=Path(tmp_path), timeout=0.01)
 
 
@@ -220,6 +261,9 @@ def _cap(monkeypatch, payload):
 @pytest.fixture(autouse=True)
 def _fresh_owner_cache():
     media._OWNER_UNITS.clear()
+    # Both caches, or a future test sharing a unit name inherits a stale
+    # 20-second stage entry and fails by ordering.
+    media._STAGE_CACHE.clear()
 
 
 @pytest.fixture
@@ -254,7 +298,10 @@ def test_progress_reads_the_journal_of_the_replica_running_the_job(monkeypatch, 
     monkeypatch.setattr(
         serve,
         "stage_progress",
-        lambda spec, s, unit=None: seen.setdefault("unit", unit),
+        # **kw, so the double keeps matching the real signature: probe_stage
+        # swallows every exception, so a fake that is merely out of date fails
+        # as "no progress available" rather than as a broken test.
+        lambda spec, s, unit=None, **kw: seen.setdefault("unit", unit),
     )
     media.probe_stage(_Spec(), 60.0, "vid_7")
     assert seen["unit"] == "deepme-llm-h3-r2", "replica index 2, not replica 0"
@@ -274,6 +321,53 @@ def test_a_job_not_running_anywhere_shows_no_bar_rather_than_a_wrong_one(monkeyp
     assert media.probe_stage(_Spec(), 60.0, "vid_9") is None
 
 
+def test_a_failing_stage_probe_backs_off_instead_of_retrying_every_tick(monkeypatch, registry):
+    """The throttle used to protect the healthy case and abandon the sick one.
+
+    The cache was written only after a SUCCESSFUL probe, so an unresponsive
+    host was never cached — and this runs inside the tick callback, on every
+    poll, with the loop's cancel checks outside it. One dead host therefore
+    re-probed and re-waited forever, freezing progress and swallowing ^C."""
+    media._STAGE_CACHE = media._BoundedCache(64)
+    calls = {"n": 0}
+
+    from deepme import serve
+
+    def always_fails(spec, s, unit=None, **kw):
+        calls["n"] += 1
+        raise RuntimeError("host is not answering")
+
+    monkeypatch.setattr(serve, "stage_progress", always_fails)
+    monkeypatch.setattr(
+        httpx, "get", lambda url, **kw: (_ for _ in ()).throw(httpx.ConnectError("x"))
+    )
+
+    for _ in range(5):
+        assert media.probe_stage(_Spec(), 60.0, "vid_1") is None
+    assert calls["n"] == 1, "a failing probe must back off, not retry every tick"
+
+
+def test_the_stage_probe_is_bounded_well_under_the_poll_interval(monkeypatch, registry):
+    """remote.run defaults to a 600s timeout — correct for an operator running
+    a command once, catastrophic inside a 5s poll tick."""
+    media._STAGE_CACHE = media._BoundedCache(64)
+    seen = {}
+
+    from deepme import serve
+
+    monkeypatch.setattr(
+        serve,
+        "stage_progress",
+        lambda spec, s, unit=None, **kw: seen.update(kw) or None,
+    )
+    monkeypatch.setattr(
+        httpx, "get", lambda url, **kw: (_ for _ in ()).throw(httpx.ConnectError("x"))
+    )
+    media.probe_stage(_Spec(), 60.0, "vid_1")
+    assert seen["timeout"] == media._STAGE_PROBE_S
+    assert media._STAGE_PROBE_S < 20.0, "must not outlast the throttle window"
+
+
 def test_direct_runs_fall_back_to_the_replicas_own_journal(monkeypatch, registry):
     """--direct targets the replica itself, which has no capacity endpoint —
     and whose own journal genuinely is the job's journal."""
@@ -288,7 +382,10 @@ def test_direct_runs_fall_back_to_the_replicas_own_journal(monkeypatch, registry
     monkeypatch.setattr(
         serve,
         "stage_progress",
-        lambda spec, s, unit=None: seen.setdefault("unit", unit),
+        # **kw, so the double keeps matching the real signature: probe_stage
+        # swallows every exception, so a fake that is merely out of date fails
+        # as "no progress available" rather than as a broken test.
+        lambda spec, s, unit=None, **kw: seen.setdefault("unit", unit),
     )
     media.probe_stage(_Spec(), 60.0, "vid_1")
     assert seen["unit"] == "deepme-llm-h3"
@@ -408,8 +505,343 @@ def test_resubmission_is_bounded_when_the_server_keeps_forgetting(monkeypatch, t
         "get",
         lambda url, **kw: _r("GET", url, 404, json={"detail": "gone"}),
     )
-    with pytest.raises(SystemExit, match="keeps forgetting"):
+    with pytest.raises(media.TicketLostError, match="keeps forgetting"):
         media.generate_video(_Spec(), "x", out_dir=tmp_path)
+
+
+def test_resubmit_disabled_turns_a_lost_job_into_a_clean_failure(monkeypatch, tmp_path):
+    """Collect-only callers (batch --fetch-existing) exist to wind work DOWN:
+    a lost job must become a loud per-item failure, and the fleet must see
+    no new submission at all."""
+    posts = []
+    monkeypatch.setattr(media.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **kw: (
+            posts.append(url) or _r("POST", url, 200, json={"id": "vid_new", "status": "queued"})
+        ),
+    )
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, **kw: _r("GET", url, 404, json={"detail": "gone"}),
+    )
+    with pytest.raises(media.TicketLostError, match="resubmission is disabled"):
+        media.generate_video(_Spec(), "x", out_dir=tmp_path, adopt="vid_dead", resubmit=False)
+    assert not posts, "a collect-only caller must never submit"
+
+
+# --------------------------------------------------------------------------
+# Stall evidence: absence must be PROVEN, never inferred from a failed read
+
+
+def _capacity_view(monkeypatch, payload):
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _r("GET", url, 200, json=payload))
+
+
+def test_an_unreachable_fleet_is_not_evidence_of_absence(monkeypatch, tmp_path):
+    """The gateway answers 200 even when a fleet's balancer cannot be asked
+    — `reachable: false`, NO running list. Counting that as absence killed
+    healthy jobs exactly while a sibling's MP4 saturated the data path: the
+    capacity probe timed out behind the download, and clients read their
+    own about-to-complete jobs as dead."""
+    _capacity_view(
+        monkeypatch,
+        {"fleets": [{"profile": "h3", "reachable": False, "free": 0}]},
+    )
+    running, _mean, evidence = media._server_view(_Spec(), "vid_1")
+    assert not running
+    assert evidence is False, "a failed read wearing a 200 proves nothing"
+
+
+def test_a_reachable_fleet_reporting_its_running_set_is_evidence(monkeypatch, tmp_path):
+    _capacity_view(
+        monkeypatch,
+        {
+            "fleets": [
+                {
+                    "profile": "h3",
+                    "reachable": True,
+                    "mean_job_s": 800.0,
+                    "running": [{"job_id": "vid_other"}],
+                }
+            ]
+        },
+    )
+    running, mean, evidence = media._server_view(_Spec(), "vid_1")
+    assert (running, mean, evidence) == (False, 800.0, True)
+    running, _mean, _e = media._server_view(_Spec(), "vid_other")
+    assert running is True
+
+
+def test_a_flat_balancer_capacity_answer_counts_as_evidence(monkeypatch, tmp_path):
+    """Direct-to-balancer callers get the flat shape with no `reachable`
+    field at all — the balancer answered for itself, which IS evidence."""
+    _capacity_view(monkeypatch, {"mean_job_s": 700.0, "running": [{"job_id": "vid_1"}]})
+    running, mean, evidence = media._server_view(_Spec(), "vid_1")
+    assert (running, mean, evidence) == (True, 700.0, True)
+
+
+def test_a_reachable_fleet_with_no_running_key_is_not_evidence():
+    """The gap that survived because the rule was written four times.
+
+    `reachable: true` with no `running` list at all is not a report of an
+    empty fleet — it is a fleet that did not answer the question. The stall
+    verdict checked for the list; the batch-status cross-check checked only
+    `reachable`, so the same payload meant "trustworthy" in one place and
+    not the other."""
+    view = media.capacity_view({"fleets": [{"profile": "h3", "reachable": True, "free": 0}]})
+    assert view.complete is False
+    assert view.absent("vid_1") is False, "absent() must never be `not holds()`"
+
+
+def test_capacity_view_is_incomplete_if_any_matching_fleet_is_silent():
+    """One good fleet does not redeem a silent one: the job may be on the
+    fleet that could not be asked."""
+    view = media.capacity_view(
+        {
+            "fleets": [
+                {"profile": "h3", "reachable": True, "running": [{"job_id": "vid_1"}]},
+                {"profile": "h3", "reachable": False},
+            ]
+        }
+    )
+    assert view.holds("vid_1") is True, "a positive sighting still counts"
+    assert view.complete is False
+    assert view.absent("vid_2") is False
+
+
+def test_capacity_view_with_no_matching_fleet_is_not_evidence():
+    """Asking about a profile nothing serves reads as an empty running set.
+    Treating that as proof of absence would kill every job on a fleet whose
+    profile name the caller got wrong."""
+    view = media.capacity_view({"fleets": [{"profile": "other", "running": []}]}, "h3")
+    assert view.complete is False
+
+
+# --------------------------------------------------------------------------
+# Stall verdicts under a controlled clock: evidence is per-IDENTITY and
+# expectations are per-DURATION
+
+
+class _Clock:
+    """Deterministic time: sleeping advances it, nothing else does."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def _run_poll(monkeypatch, *, handover_at, view, end=None, expected_s=None, deadline=1e9):
+    """Drive media._poll against a scripted balancer.
+
+    The status endpoint answers as a queued ticket until `handover_at`,
+    then as the rewritten real-job body (the balancer's transparent ticket
+    rewrite); `view` scripts _server_view; `end` optionally completes the
+    job at a given clock time.
+    """
+    clock = _Clock()
+    monkeypatch.setattr(media.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(media.time, "sleep", clock.sleep)
+    monkeypatch.setattr(media, "probe_stage", lambda *a, **k: None)
+
+    def status(url, **kw):
+        if end is not None and clock.t >= end:
+            return _r("GET", url, 200, json={"id": "vid_real", "status": "completed"})
+        if clock.t >= handover_at:
+            return _r("GET", url, 200, json={"id": "vid_real", "status": "queued"})
+        return _r("GET", url, 200, json={"id": "q_t1", "status": "queued", "queue_position": 1})
+
+    monkeypatch.setattr(httpx, "get", status)
+    monkeypatch.setattr(media, "_server_view", lambda spec, mid: view(clock.t, mid))
+    return media._poll(
+        _Spec(),
+        "q_t1",
+        deadline=deadline,
+        every=5.0,
+        started=0.0,
+        expected_s=expected_s,
+    )
+
+
+def _poll_against(monkeypatch, status, *, view=None, deadline=1e9):
+    """Drive media._poll against an arbitrary scripted status endpoint.
+
+    Every test below asserts the poll TERMINATES. Before these, each of these
+    server states polled forever: the loop's only exits were terminal status,
+    a 404 streak, or a verdict that required trusted capacity evidence about a
+    non-ticket id — and none of these states can ever produce that.
+    """
+    clock = _Clock()
+    monkeypatch.setattr(media.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(media.time, "sleep", clock.sleep)
+    monkeypatch.setattr(media, "probe_stage", lambda *a, **k: None)
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: status(clock, url, **kw))
+    monkeypatch.setattr(media, "_server_view", view or (lambda spec, mid: (False, None, False)))
+    return media._poll(_Spec(), "q_t1", deadline=deadline, every=5.0, started=0.0)
+
+
+def test_a_ticket_on_a_fleet_with_no_accepting_replicas_is_executed(monkeypatch):
+    """THE forever-hang. A queued ticket is exempt from every other verdict —
+    waiting is legitimate and unbounded — so when the fleet can never start it
+    the client waits forever and is right to. `accepting_replicas: 0` is the
+    fleet stating no replica can EVER take this, which is a positive fact, not
+    a guess about elapsed time."""
+
+    def dead_fleet(clock, url, **kw):
+        return _r(
+            "GET",
+            url,
+            200,
+            json={
+                "id": "q_t1",
+                "status": "queued",
+                "queue_position": 0,
+                "accepting_replicas": 0,
+            },
+        )
+
+    with pytest.raises(media.StalledError, match="NO replica accepting work"):
+        _poll_against(monkeypatch, dead_fleet)
+
+
+def test_a_ticket_merely_waiting_behind_work_is_never_executed(monkeypatch):
+    """The other half: a fleet that CAN serve, with the ticket behind a long
+    generation, must keep waiting however long that takes. Killing this is
+    exactly the behaviour the platform refuses."""
+
+    def busy_fleet(clock, url, **kw):
+        if clock.t >= 100_000.0:
+            return _r("GET", url, 200, json={"id": "vid_real", "status": "completed"})
+        return _r(
+            "GET",
+            url,
+            200,
+            json={
+                "id": "q_t1",
+                "status": "queued",
+                "queue_position": 3,
+                "accepting_replicas": 4,
+            },
+        )
+
+    job = _poll_against(monkeypatch, busy_fleet)
+    assert job["status"] == "completed", "a servable queue must wait indefinitely"
+
+
+def test_a_rejected_credential_is_reported_not_retried(monkeypatch):
+    """401 is the same answer every time. With no else-branch it fell through
+    every case — `lost` never incremented, no verdict armed — so the caller
+    polled a 401 forever and was never told the key was wrong."""
+
+    def unauthorized(clock, url, **kw):
+        return _r("GET", url, 401, json={"detail": "nope"})
+
+    with pytest.raises(media.GenerationRejected, match="credentials"):
+        _poll_against(monkeypatch, unauthorized)
+
+
+def test_a_persistently_unreadable_platform_is_executed(monkeypatch):
+    """A crash-looping service answering 5xx forever. The 404 branch's comment
+    promised 5xx 'must not keep a dead id alive forever'; falling through
+    without counting achieved precisely that."""
+
+    def broken(clock, url, **kw):
+        return _r("GET", url, 502, json={"detail": "bad gateway"})
+
+    with pytest.raises(media.StalledError, match="consecutive polls"):
+        _poll_against(monkeypatch, broken)
+
+
+def test_an_unreachable_platform_is_executed(monkeypatch):
+    """The gateway goes away mid-run: no response at all, so the 404 branch is
+    unreachable and the capacity read fails and is suppressed. Nothing counted
+    transport failures, so the caller polled a dead host indefinitely."""
+
+    def gone(clock, url, **kw):
+        raise httpx.ConnectError("connection refused")
+
+    with pytest.raises(media.StalledError, match="could not reach"):
+        _poll_against(monkeypatch, gone)
+
+
+def test_queue_wait_absence_does_not_execute_a_fresh_handover(monkeypatch, tmp_path):
+    """THE 39x bug: a ticket is rightly absent from the running set for its
+    whole queue wait, but the counter carried across the handover — verdict
+    1 fired the instant the q_ exemption lifted, on evidence about an id
+    the work no longer was. A 30-minute queue must not kill a job seconds
+    after a replica finally takes it."""
+    job = _run_poll(
+        monkeypatch,
+        handover_at=1800.0,  # 30 min queued: 30 evidence beats of "absence"
+        view=lambda t, mid: (False, 800.0, True),  # never seen running at all
+        end=2050.0,  # completes 250s after handover — under the fresh grace
+    )
+    assert job["status"] == "completed"
+
+
+def test_a_handed_over_job_confirmed_absent_is_still_executed(monkeypatch, tmp_path):
+    """The detector must still detect: absence PROVEN about the real id,
+    past the grace window, counted from the handover."""
+    with pytest.raises(media.StalledError, match="a replica took it"):
+        _run_poll(
+            monkeypatch,
+            handover_at=600.0,
+            view=lambda t, mid: (False, 800.0, True),
+        )
+
+
+def test_a_long_clip_is_not_executed_against_a_short_clip_mean(monkeypatch, tmp_path):
+    """A 15s clip measures 5.7x a 4s clip (superlinear), but the fleet mean
+    is dominated by short clips — 3x mean sits BELOW a 15s clip's honest
+    wall time, and every long clip on a mixed fleet was killed
+    mid-generation as 'wedged'. The measured duration curve is the
+    per-request baseline."""
+    running_view = lambda t, mid: (True, 843.0, True)  # noqa: E731
+    # Old rule killed at 3x843=2529s; the 15s expectation (~3645s) lifts the
+    # limit to ~10935s. Ends by deadline at 4500s: past the old limit, under
+    # the honest one — must be a timeout, never a stall verdict.
+    with pytest.raises(media.GenerationTimeout, match="did not finish"):
+        _run_poll(
+            monkeypatch,
+            handover_at=0.0,
+            view=running_view,
+            expected_s=3644.7,
+            deadline=4500.0,
+        )
+    # And a genuinely wedged engine is still caught past the lifted limit.
+    with pytest.raises(media.StalledError, match="almost certainly wedged"):
+        _run_poll(
+            monkeypatch,
+            handover_at=0.0,
+            view=running_view,
+            expected_s=3644.7,
+        )
+
+
+def test_expected_wall_time_interpolates_the_measured_curve(monkeypatch):
+    class _Cfg:
+        duration_points: ClassVar[list[dict]] = [
+            {"seconds": 4.0, "gpu_seconds": 644.2},
+            {"seconds": 10.0, "gpu_seconds": 1796.8},
+            {"seconds": 15.0, "gpu_seconds": 3644.7},
+        ]
+
+    from deepme import economics
+
+    monkeypatch.setattr(economics, "load", lambda path=None: _Cfg())
+    assert media._expected_job_s(4.0) == pytest.approx(644.2)
+    assert media._expected_job_s(15.0) == pytest.approx(3644.7)
+    mid = media._expected_job_s(12.5)
+    assert 1796.8 < mid < 3644.7, "between the measured points"
+    assert media._expected_job_s(20.0) > 3644.7, "extrapolates past the last"
+    assert media._expected_job_s(None) is None
 
 
 # --------------------------------------------------------------------------

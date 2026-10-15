@@ -113,19 +113,19 @@ balancer = 9100
 
 def test_asking_for_an_undeclared_profile_says_where_to_add_it(tmp_path):
     reg = ports.load(write(tmp_path, CLEAN))
-    with pytest.raises(SystemExit, match="no replica ports declared"):
+    with pytest.raises(ports.PortsError, match="no replica ports declared"):
         reg.replica_ports("absent")
 
 
 def test_running_out_of_declared_replica_ports_is_explicit(tmp_path):
     """Better than silently reusing one and colliding at runtime."""
     reg = ports.load(write(tmp_path, CLEAN))
-    with pytest.raises(SystemExit, match="declares 1 replica port"):
+    with pytest.raises(ports.PortsError, match="declares 1 replica port"):
         reg.replica_port("b", 3)
 
 
 def test_a_missing_registry_is_reported(tmp_path):
-    with pytest.raises(SystemExit, match="missing port registry"):
+    with pytest.raises(ports.PortsError, match="missing port registry"):
         ports.load(tmp_path / "nope.toml")
 
 

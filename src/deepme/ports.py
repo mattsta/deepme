@@ -30,6 +30,18 @@ DIFFUSION_SPAN = 2
 DEFAULT_SPAN = 1
 
 
+class PortsError(Exception):
+    """The registry cannot answer a port question.
+
+    An ordinary exception, never SystemExit: this is reached from BATCH
+    WORKER THREADS (progress ticks resolve a job's replica through the
+    registry). A BaseException there passes through every `except
+    Exception` guard, aborts the pool from a worker, and leaves the
+    remaining generations running headless — and callers that survey many
+    profiles have to be able to skip one that lacks a balancer port.
+    """
+
+
 @dataclass(frozen=True)
 class Allocation:
     """One reserved range and who holds it."""
@@ -62,9 +74,9 @@ class Registry:
     def _indexed(self, table: dict[str, list[int]], kind: str, profile: str, replica: int) -> int:
         ports = table.get(profile)
         if not ports:
-            raise SystemExit(f"no {kind} ports declared for {profile!r} in {REGISTRY}")
+            raise PortsError(f"no {kind} ports declared for {profile!r} in {REGISTRY}")
         if replica >= len(ports):
-            raise SystemExit(
+            raise PortsError(
                 f"{profile!r} declares {len(ports)} {kind} port(s) but replica "
                 f"{replica} was requested — add more in {REGISTRY}."
             )
@@ -79,7 +91,7 @@ class Registry:
     def replica_ports(self, profile: str) -> list[int]:
         ports = self.replicas.get(profile)
         if not ports:
-            raise SystemExit(
+            raise PortsError(
                 f"no replica ports declared for {profile!r} in {REGISTRY}. "
                 f"Add a [profiles.{profile}] section with `replicas = [...]`."
             )
@@ -88,7 +100,7 @@ class Registry:
     def replica_port(self, profile: str, replica: int) -> int:
         ports = self.replica_ports(profile)
         if replica >= len(ports):
-            raise SystemExit(
+            raise PortsError(
                 f"{profile!r} declares {len(ports)} replica port(s) but replica "
                 f"{replica} was requested — add more to [profiles.{profile}] "
                 f"in {REGISTRY}."
@@ -98,13 +110,13 @@ class Registry:
     def balancer_port(self, profile: str) -> int:
         port = self.balancers.get(profile)
         if port is None:
-            raise SystemExit(f"no balancer port declared for {profile!r} in {REGISTRY}")
+            raise PortsError(f"no balancer port declared for {profile!r} in {REGISTRY}")
         return port
 
     def service_port(self, name: str) -> int:
         port = self.services.get(name)
         if port is None:
-            raise SystemExit(f"no port declared for service {name!r} in {REGISTRY}")
+            raise PortsError(f"no port declared for service {name!r} in {REGISTRY}")
         return port
 
     def span_for(self, profile: str) -> int:
@@ -136,7 +148,7 @@ class Registry:
 def load(path: Path | None = None) -> Registry:
     source = path or REGISTRY
     if not source.exists():
-        raise SystemExit(f"missing port registry: {source}")
+        raise PortsError(f"missing port registry: {source}")
     raw = tomllib.loads(source.read_text())
     profiles_raw = raw.get("profiles", {})
     return Registry(

@@ -523,16 +523,31 @@ never typed into code.
 
 ---
 
-## 4d. Artifact retention
+## 4d. Artifact reclamation
 
-Generated files are reclaimed on the platform's own clock — nothing
-accumulates until a full disk fails generations:
+A file is reclaimed when its owner says so, with time as the backstop —
+never the other way round:
 
-| state                 | kept for                                             |
-| --------------------- | ---------------------------------------------------- |
-| never fetched         | **6 hours** from creation (the initial-fetch window) |
-| fetched at least once | **1 hour** from the FIRST fetch (a re-fetch window)  |
-| job still running     | untouchable, regardless of age                       |
+| state                   | reclaimed                              |
+| ----------------------- | -------------------------------------- |
+| **acked** by the client | **immediately** (`DELETE .../content`) |
+| delivered, not acked    | **1 hour** from the FIRST delivery     |
+| never fetched           | **6 hours** from creation              |
+| job still running       | untouchable, regardless of age         |
+
+`DELETE /v1/videos/{id}/content` is the ACK: "I have persisted these bytes,
+reclaim your copy." It returns `{id, reclaimed: <files>}`, is idempotent (a
+retried ack answers 200 with `reclaimed: 0`), and is **not** a cancellation —
+`DELETE` on the job cancels work, `DELETE` on `/content` only frees the file.
+It is never forwarded to a replica.
+
+Deleting on DELIVERY instead — which this replaced — made every transfer
+single-shot: a caller that received 200 and then failed to write lost the
+work permanently, with no way to ask again. We own both ends of this
+protocol, so possession is confirmed rather than assumed. The guarantee that
+motivated delete-on-delivery is unchanged, because the retention clock starts
+at first delivery whether or not an ack arrives: a client that dies mid-write
+cannot strand a file, and nothing lingers long enough for an id to be reused.
 
 The window starts at the first `/content` read and is **not** extended by
 repeat fetches. After expiry, `GET .../content` returns 404 — re-generate if

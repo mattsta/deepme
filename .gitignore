@@ -11,3 +11,6 @@ wheels/
 
 # deepme local state (API keys, run artifacts)
 .deepme/
+
+/*.txt
+/*.jsonl

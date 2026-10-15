@@ -93,6 +93,12 @@ def start(specs: list[RunSpec], *, force: bool = False) -> str:
     unit_name, port = unit_for(profile), port_for(profile)
     for name in ("balance.py", "admission.py", "server.py"):
         remote.write_remote_file(f"{BALANCER_DIR}/{name}", (LOCAL / name).read_text())
+    # Shared with the gateway, so it lives outside both service directories
+    # and is pushed FLAT into each. Omitting it here does not fail a check —
+    # it fails the service at import time, on the server, after a restart.
+    remote.write_remote_file(
+        f"{BALANCER_DIR}/proxycore.py", (config.SHARED_DIR / "proxycore.py").read_text()
+    )
     urls = backends(specs)
     unit = f"""\
 [Unit]
@@ -136,11 +142,24 @@ def api_base(profile: str) -> str:
     return f"http://{config.SSH_HOST}:{port_for(profile)}"
 
 
+def auth_headers() -> dict[str, str]:
+    """Credentials for the CONTROL PLANE (/balancer/*, /gateway/*).
+
+    Every operator call carries these so the servers can start REQUIRING
+    them: today those routes accept anyone who can reach the port, and
+    `/gateway/reload` alone can repoint the whole fleet. Sending the key
+    before it is enforced is harmless — the balancer already injects the
+    same key when a caller sends none.
+    """
+    key = config.api_key()
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 def stats(profile: str) -> dict:
     """Live per-replica load for one model, as its balancer sees it."""
     import httpx
 
-    r = httpx.get(f"{api_base(profile)}/balancer/stats", timeout=10)
+    r = httpx.get(f"{api_base(profile)}/balancer/stats", timeout=10, headers=auth_headers())
     r.raise_for_status()
     return dict(r.json())
 
@@ -163,7 +182,12 @@ def queue(profile: str) -> dict:
 def attach(profile: str, replica_url: str) -> dict:
     import httpx
 
-    r = httpx.post(f"{api_base(profile)}/balancer/backends", json={"url": replica_url}, timeout=30)
+    r = httpx.post(
+        f"{api_base(profile)}/balancer/backends",
+        json={"url": replica_url},
+        timeout=30,
+        headers=auth_headers(),
+    )
     r.raise_for_status()
     return dict(r.json())
 
@@ -172,7 +196,10 @@ def drain(profile: str, replica_url: str) -> dict:
     import httpx
 
     r = httpx.post(
-        f"{api_base(profile)}/balancer/backends/drain", json={"url": replica_url}, timeout=10
+        f"{api_base(profile)}/balancer/backends/drain",
+        json={"url": replica_url},
+        timeout=10,
+        headers=auth_headers(),
     )
     r.raise_for_status()
     return dict(r.json())
@@ -182,7 +209,10 @@ def detach(profile: str, replica_url: str) -> dict:
     import httpx
 
     r = httpx.delete(
-        f"{api_base(profile)}/balancer/backends", params={"url": replica_url}, timeout=10
+        f"{api_base(profile)}/balancer/backends",
+        params={"url": replica_url},
+        timeout=10,
+        headers=auth_headers(),
     )
     r.raise_for_status()
     return dict(r.json())
@@ -192,7 +222,10 @@ def undrain(profile: str, replica_url: str) -> dict:
     import httpx
 
     r = httpx.post(
-        f"{api_base(profile)}/balancer/backends/undrain", json={"url": replica_url}, timeout=10
+        f"{api_base(profile)}/balancer/backends/undrain",
+        json={"url": replica_url},
+        timeout=10,
+        headers=auth_headers(),
     )
     r.raise_for_status()
     return dict(r.json())
@@ -219,7 +252,7 @@ def wait_drained(
     while time.monotonic() < deadline:
         inflight: int | str = "?"
         try:
-            r = httpx.get(f"{api_base(profile)}/balancer/stats", timeout=10)
+            r = httpx.get(f"{api_base(profile)}/balancer/stats", timeout=10, headers=auth_headers())
             r.raise_for_status()
             backends = {b["url"]: b for b in r.json().get("backends", [])}
             st = backends.get(replica_url)
@@ -232,6 +265,24 @@ def wait_drained(
             on_tick(inflight)
         time.sleep(poll_s)
     return False
+
+
+def audit(profile: str, lines: int = 200, grep: str = "") -> str:
+    """The balancer's persistent lifecycle trail (audit.jsonl).
+
+    The event ring holds 500 entries in MEMORY and dies with the process,
+    so after any restart "what happened last night" is only answerable
+    from this file — which nothing could read until now. Includes the
+    rotated `.1` so a rotation boundary does not hide the interesting hour.
+    """
+    import shlex
+
+    base = f"{config.REMOTE_HOME}/deepme-work/{profile}/audit.jsonl"
+    filt = f" | grep -F {shlex.quote(grep)}" if grep else ""
+    return remote.run(
+        f"cat {base}.1 {base} 2>/dev/null{filt} | tail -n {int(lines)}",
+        check=False,
+    ).stdout
 
 
 def logs(profile: str, lines: int = 100) -> str:

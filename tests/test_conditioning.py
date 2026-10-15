@@ -33,12 +33,12 @@ def test_remote_and_inline_uris_pass_through_untouched(src):
 
 
 def test_a_missing_local_file_fails_before_the_request(tmp_path):
-    with pytest.raises(SystemExit, match="no such file"):
+    with pytest.raises(media.RequestInvalid, match="no such file"):
         media.as_uri(str(tmp_path / "nope.png"))
 
 
 def test_unknown_media_types_are_rejected_with_the_supported_list():
-    with pytest.raises(SystemExit, match="supported extensions"):
+    with pytest.raises(media.RequestInvalid, match="supported extensions"):
         media.media_type_of("notes.txt")
 
 
@@ -62,7 +62,7 @@ def test_no_keyframes_means_no_conditions():
 def test_a_video_keyframe_is_rejected(tmp_path):
     vid = tmp_path / "v.mp4"
     vid.write_bytes(b"x")
-    with pytest.raises(SystemExit, match="keyframes must be images"):
+    with pytest.raises(media.RequestInvalid, match="keyframes must be images"):
         media.keyframe_conditions(str(vid), None)
 
 

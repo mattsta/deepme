@@ -13,8 +13,10 @@ for minutes. Anything that treats the POST as the work is wrong, and that is
 what these tests pin down.
 """
 
+import asyncio
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -91,6 +93,10 @@ def bal(fleet, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     os.environ.update(BALANCER_BACKENDS=json.dumps([R1, R2]), BALANCER_API_KEY="")
     directory = SRC / "balancer"
+    # proxycore is deployed FLAT next to server.py, so it must be importable
+    # by bare name here too — otherwise the tests exercise an import graph
+    # the server never has.
+    sys.path.insert(0, str(SRC / "shared"))
     sys.path.insert(0, str(directory))
     try:
         spec = importlib.util.spec_from_file_location("bal_integration", directory / "server.py")
@@ -727,6 +733,164 @@ def test_boot_recovers_occupancy_from_replica_truth(bal, fleet):
         assert stats[R2]["inflight"] == 0
 
 
+def test_a_delivered_artifact_survives_until_the_client_acks(bal, fleet, tmp_path):
+    """Delivery is not proof of possession.
+
+    Deleting on delivery made the transfer single-shot: a caller that got 200
+    and then failed to write — no such directory, disk full, killed mid-flush
+    — lost the work permanently, with no way to ask again. We own both ends
+    of this protocol, so the client says when it is safe."""
+    work = tmp_path / "work"
+    (work / "outputs").mkdir(parents=True)
+    bal.WORK_DIR = str(work)
+
+    with TestClient(bal.app) as client:
+        job = _submit(client).json()
+        fleet.complete(job["id"])
+        artifact = work / "outputs" / f"{job['id']}.mp4"
+        artifact.write_bytes(b"the only copy")
+
+        assert client.get(f"/v1/videos/{job['id']}/content").status_code == 200
+        assert artifact.exists(), (
+            "the server must still hold it — the client may not have written it"
+        )
+
+        # The client persisted it and says so.
+        ack = client.delete(f"/v1/videos/{job['id']}/content")
+        assert ack.status_code == 200
+        assert ack.json()["reclaimed"] == 1
+        assert not artifact.exists(), "acked means reclaimed"
+
+
+def test_the_ack_is_idempotent_and_is_not_a_cancellation(bal, fleet, tmp_path):
+    """A client must be able to retry an ack whose response was lost, and
+    acking an artifact must never be mistaken for cancelling the job that
+    produced it."""
+    work = tmp_path / "work"
+    (work / "outputs").mkdir(parents=True)
+    bal.WORK_DIR = str(work)
+
+    with TestClient(bal.app) as client:
+        job = _submit(client).json()
+        (work / "outputs" / f"{job['id']}.mp4").write_bytes(b"x")
+        before = bal.bal.snapshot()["active_jobs"]
+
+        assert client.delete(f"/v1/videos/{job['id']}/content").json()["reclaimed"] == 1
+        second = client.delete(f"/v1/videos/{job['id']}/content")
+        assert second.status_code == 200, "a retried ack must not error"
+        assert second.json()["reclaimed"] == 0
+
+        assert bal.bal.snapshot()["active_jobs"] == before, (
+            "acking an ARTIFACT must not end the JOB — that is what DELETE on the job itself means"
+        )
+
+
+def test_waiting_tickets_are_refused_once_the_fleet_is_provably_dead(bal, fleet):
+    """The waiting ticket was the only unbounded object in the system.
+
+    Every path to REJECTED lives inside _pump AFTER pick() returns a target —
+    and pick() returns None on a dead fleet, so the pump bails before reaching
+    the code that could refuse anything. Client-side, a queued ticket is
+    exempt from every stall verdict. The pair deadlocked forever."""
+    with TestClient(bal.app) as client:
+        for st in bal.bal.stats.values():
+            st.healthy = False
+        r = _submit(client, "work nothing can take")
+        ticket = r.json()["id"]
+        assert r.status_code == 202 and ticket.startswith("q_"), (
+            "an unhealthy fleet must still QUEUE — refusing at submit time is "
+            "what broke fleet-switch bootstrapping"
+        )
+
+        bal.FLEET_DEAD_STRIKES = 3
+        bal._fleet_dead_beats = 0
+        for _ in range(2):
+            bal._fail_unservable_tickets()
+        assert client.get(f"/v1/videos/{ticket}").json()["status"] == "queued"
+
+        bal._fail_unservable_tickets()  # third strike
+        body = client.get(f"/v1/videos/{ticket}").json()
+        assert body["status"] == "failed", "a ticket nothing can serve must end"
+        assert body["billable"] is False, "never submitted, so never billed"
+        assert "0 accepting" in str(body.get("error") or "")
+        assert bal.submit_unservable == 1
+
+
+def test_one_accepting_replica_clears_the_dead_fleet_count(bal, fleet):
+    """A fleet switch or a blip must never refuse legitimately queued work.
+    The count resets on any accepting replica, so a drain would have to
+    outlast every beat in the window to trip it."""
+    with TestClient(bal.app) as client:
+        for st in bal.bal.stats.values():
+            st.healthy = False
+        ticket = _submit(client, "work").json()["id"]
+
+        bal.FLEET_DEAD_STRIKES = 3
+        bal._fleet_dead_beats = 0
+        bal._fail_unservable_tickets()
+        bal._fail_unservable_tickets()
+        next(iter(bal.bal.stats.values())).healthy = True  # a replica returns
+        bal._fail_unservable_tickets()
+        assert bal._fleet_dead_beats == 0
+
+        for st in bal.bal.stats.values():
+            st.healthy = False
+        bal._fail_unservable_tickets()
+        assert client.get(f"/v1/videos/{ticket}").json()["status"] == "queued", (
+            "the count restarted, so the ticket survives"
+        )
+
+
+def test_a_queued_ticket_reports_whether_anything_can_serve_it(bal, fleet):
+    """Without this field a poll on a dead fleet is byte-identical to one
+    next in line behind a long generation."""
+    with TestClient(bal.app) as client:
+        for st in bal.bal.stats.values():
+            st.healthy = False
+        ticket = _submit(client, "work").json()["id"]
+        assert client.get(f"/v1/videos/{ticket}").json()["accepting_replicas"] == 0
+        for st in bal.bal.stats.values():
+            st.healthy = True
+        assert client.get(f"/v1/videos/{ticket}").json()["accepting_replicas"] > 0
+
+
+def test_sweep_adopts_a_ghost_job_born_after_boot(bal, fleet):
+    """The ghost: the engine ACCEPTED a generation we never recorded (our
+    POST timed out mid-accept, or an ambiguous submit was rejected after the
+    work started). It burns a GPU that pick() still counts as free, so the
+    replica gets double-booked. Boot recovery alone never saw it, because it
+    was born after boot."""
+
+    listing: list[dict] = []
+
+    def with_listing(request):
+        if request.url.path == "/v1/videos" and request.method == "GET":
+            base = f"{request.url.scheme}://{request.url.host}"
+            return httpx.Response(200, json={"data": listing if base == R1 else []})
+        return fleet.handler(request)
+
+    bal.ctl = bal.client = httpx.AsyncClient(transport=httpx.MockTransport(with_listing))
+    with TestClient(bal.app) as client:
+        client.portal.call(bal._recover_occupancy)
+        assert bal.bal.snapshot()["active_jobs"] == 0, "nothing running at boot"
+
+        # The engine starts a job we never learn about.
+        listing.append({"id": "vid_ghost", "status": "in_progress"})
+        before = bal.orphans_adopted
+        adopted = client.portal.call(lambda: bal._recover_occupancy(boot=False))
+
+        assert adopted == 1
+        assert bal.orphans_adopted == before + 1, "counted, so an operator can alert"
+        stats = {s["url"]: s for s in bal.bal.snapshot()["backends"]}
+        assert stats[R1]["inflight"] == 1, "the ghost now occupies its slot"
+
+        # Idempotent: a second sweep over the same listing adopts nothing and
+        # must not inflate occupancy, or a long job would fill the fleet with
+        # copies of itself one beat at a time.
+        assert client.portal.call(lambda: bal._recover_occupancy(boot=False)) == 0
+        assert bal.bal.snapshot()["active_jobs"] == 1
+
+
 # --------------------------------------------------------------------------
 # Artifact retention: 6h initial-fetch window, 1h re-fetch window
 
@@ -908,3 +1072,358 @@ def test_a_slow_subscriber_gets_a_gap_never_backpressure(bal, fleet):
         assert [e["type"] for e in drained] == ["gap"]
     finally:
         bal._subscribers.discard(q)
+
+
+# --------------------------------------------------------------------------
+# Identity integrity: an id must NEVER resolve to another job's replica
+
+
+def test_two_replicas_claiming_one_id_is_a_conflict_not_an_absence(bal, fleet):
+    """409, never 404. The id exists TWICE — a 404 tells the client it is
+    unknown and therefore safe to resubmit, which is the opposite of the
+    truth and bills the same work again."""
+
+    def both_claim(request):
+        return httpx.Response(200, json={"id": "vid_dup", "status": "queued"})
+
+    bal.ctl = httpx.AsyncClient(transport=httpx.MockTransport(both_claim))
+    with TestClient(bal.app) as client:
+        r = client.get("/v1/videos/vid_dup")
+    assert r.status_code == 409
+    assert r.json()["retryable"] is False
+
+
+def test_owner_probe_ignores_a_replica_answering_for_a_foreign_id(bal, fleet):
+    """A 200 alone proves nothing — the body must NAME the probed id."""
+
+    def foreign_first(request):
+        if "replica-1" in str(request.url):
+            # Answers happily... about some other job entirely.
+            return httpx.Response(200, json={"id": "vid_other", "status": "queued"})
+        if str(request.url.path).endswith("vid_x"):
+            return httpx.Response(200, json={"id": "vid_x", "status": "queued"})
+        return httpx.Response(404, json={})
+
+    t = httpx.AsyncClient(transport=httpx.MockTransport(foreign_first))
+    bal.ctl = t
+    bal.client = t
+    with TestClient(bal.app) as client:
+        r = client.get("/v1/videos/vid_x")
+    assert r.status_code == 200
+    assert r.json()["id"] == "vid_x"
+    assert bal.bal.owner("vid_x") == R2, "bound to the VERIFIED claimant"
+
+
+def test_an_ambiguous_submission_failure_is_terminal_not_a_duplicate(bal, fleet):
+    """A read timeout AFTER the request may have reached the engine must
+    never requeue: the engine may already hold the job, and the requeue
+    generated the same prompt twice (one ghost per timeout). The ticket
+    fails LOUDLY instead, and no second POST reaches any replica."""
+    with TestClient(bal.app) as client:
+        a = _submit(client).json()
+        b = _submit(client).json()
+        t = _submit(client, prompt="queued-one")
+        assert t.status_code == 202
+        ticket = t.json()["id"]
+        posts_before = len(fleet.posts)
+
+        def slow_accept(request):
+            if request.method == "POST":
+                raise httpx.ReadTimeout("engine grinding, accept > timeout")
+            return fleet.handler(request)
+
+        bal.ctl = httpx.AsyncClient(transport=httpx.MockTransport(slow_accept))
+        fleet.complete(a["id"])
+        fleet.complete(b["id"])
+        client.get(f"/v1/videos/{a['id']}")  # close -> pump -> timeout
+        r = client.get(f"/v1/videos/{ticket}")
+    assert r.json()["status"] == "failed"
+    assert "outcome unknown" in r.json()["error"]["message"]
+    assert len(fleet.posts) == posts_before, "no blind second submission"
+
+
+def test_a_connect_failure_still_requeues_safely(bal, fleet):
+    """CONNECT-phase failure proves the request never arrived — the one
+    case where requeueing cannot duplicate."""
+    with TestClient(bal.app) as client:
+        a = _submit(client).json()
+        b = _submit(client).json()
+        t = _submit(client, prompt="queued-one")
+        ticket = t.json()["id"]
+
+        def refused(request):
+            if request.method == "POST":
+                raise httpx.ConnectError("connection refused")
+            return fleet.handler(request)
+
+        bal.ctl = httpx.AsyncClient(transport=httpx.MockTransport(refused))
+        fleet.complete(a["id"])
+        fleet.complete(b["id"])
+        client.get(f"/v1/videos/{a['id']}")
+        r = client.get(f"/v1/videos/{ticket}")
+    assert r.json()["status"] == "queued", "back in the queue, not failed"
+
+
+def test_a_completed_download_starts_the_refetch_window_a_cut_one_does_not(bal, fleet):
+    """_fetched marks on the LAST byte, not the first request: a download a
+    gateway restart cut mid-stream must not burn the only re-fetch window
+    of billed work."""
+    with TestClient(bal.app) as client:
+        job = _submit(client).json()
+        fleet.complete(job["id"])
+        r = client.get(f"/v1/videos/{job['id']}/content")
+        assert r.content == b"MP4"
+    assert job["id"] in bal._fetched, "full read -> window started"
+
+
+def test_job_scoped_responses_carry_the_effective_id_header(bal, fleet):
+    """The gateway learns ticket->job bindings from this header instead of
+    probing — the header IS the authoritative ownership statement."""
+    with TestClient(bal.app) as client:
+        job = _submit(client).json()
+        r = client.get(f"/v1/videos/{job['id']}")
+    assert r.headers.get("x-deepme-job-id") == job["id"]
+
+
+def test_every_lifecycle_event_lands_in_the_persistent_audit_log(bal, fleet, tmp_path):
+    """The firehose forgets after 500 events; incidents ask about last
+    Tuesday. Same events, appended to disk."""
+    bal.AUDIT_LOG = str(tmp_path / "audit.jsonl")
+    with TestClient(bal.app) as client:
+        job = _submit(client).json()
+        fleet.complete(job["id"])
+        client.get(f"/v1/videos/{job['id']}")
+    lines = [json.loads(x) for x in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    kinds = [e["type"] for e in lines]
+    assert "started" in kinds and "terminal" in kinds
+    terminal = next(e for e in lines if e["type"] == "terminal")
+    assert terminal["job_id"] == job["id"]
+
+
+# --------------------------------------------------------------------------
+# Liveness: the queue must work in exactly the windows it exists for
+
+
+def test_a_fully_drained_fleet_queues_instead_of_refusing(bal, fleet):
+    """THE fleet-switch hole: with every replica drained, `_all_busy` read
+    False (no accepting replicas at all), admission waved the request
+    through to pick(), which had nothing — so the caller got 503 and the
+    queue could never bootstrap, because the 'someone is waiting' path
+    needs a first ticket to exist."""
+    with TestClient(bal.app) as client:
+        client.post("/balancer/backends/drain", json={"url": R1})
+        client.post("/balancer/backends/drain", json={"url": R2})
+        r = _submit(client, prompt="during the switch")
+    assert r.status_code == 202, "held for the new fleet, not refused"
+    assert r.json()["id"].startswith("q_")
+
+
+def test_an_unhealthy_fleet_also_queues(bal, fleet):
+    """Same predicate, the transient case: a fleet-wide blip must park work
+    until _revive_backends re-arms, not reject it."""
+    bal.bal.mark(R1, healthy=False)
+    bal.bal.mark(R2, healthy=False)
+    with TestClient(bal.app) as client:
+        r = _submit(client, prompt="during the blip")
+    assert r.status_code == 202
+
+
+def test_boot_recovery_completes_before_the_first_request_routes(bal, fleet):
+    """A restart with replicas mid-generation must not double-book them.
+    Recovery used to be scheduled (create_task) rather than awaited, so
+    startup finished with an empty job map and pick() handed new work to a
+    replica already generating."""
+    fleet.jobs["vid_live"] = {"id": "vid_live", "status": "queued", "owner": R1}
+
+    def with_listing(request):
+        if request.method == "GET" and request.url.path == "/v1/videos":
+            base = f"{request.url.scheme}://{request.url.host}"
+            here = [j for j in fleet.jobs.values() if j["owner"] == base]
+            return httpx.Response(200, json={"data": here})
+        return fleet.handler(request)
+
+    bal.ctl = httpx.AsyncClient(transport=httpx.MockTransport(with_listing))
+    with TestClient(bal.app) as client:
+        # The very first request already sees the recovered occupancy.
+        assert bal.bal.owner("vid_live") == R1
+        r = client.get("/v1/capacity")
+    assert r.json()["busy"] == 1, "the running job holds its slot from boot"
+
+
+def test_a_failing_maintenance_beat_is_counted_not_swallowed(bal, fleet):
+    """The maintenance loop IS the liveness invariant; a blanket suppress
+    made a permanently dead loop indistinguishable from a healthy idle
+    one."""
+    before = bal.maintenance_errors
+    bal.maintenance_errors = before + 1
+    with TestClient(bal.app) as client:
+        body = client.get("/metrics").text
+    assert f"deepme_maintenance_errors_total {before + 1}" in body
+
+
+def test_retention_survives_a_file_vanishing_mid_scan(bal, fleet, tmp_path, monkeypatch):
+    """A file removed between the walk and the stat is routine. Suppressing
+    around the WHOLE walk abandoned the traversal, so a recurring race
+    silently disabled retention while stats still reported it enabled."""
+    import time as _time
+
+    work = tmp_path / "work"
+    (work / "outputs" / "nested").mkdir(parents=True)
+    (work / "inputs").mkdir()
+    old = _time.time() - 7 * 3600
+    keep = work / "outputs" / "nested" / "expired.mp4"
+    keep.write_bytes(b"x")
+    os.utime(keep, (old, old))
+    monkeypatch.setattr(bal, "WORK_DIR", str(work))
+
+    real_stat = Path.stat
+    ghost = work / "outputs" / "ghost.mp4"
+    ghost.write_bytes(b"x")
+
+    def flaky_stat(self, *a, **kw):
+        if self.name == "ghost.mp4":
+            raise FileNotFoundError(self)
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    bal._retention_pass()
+    assert not keep.exists(), "the nested expired file still got reclaimed"
+
+
+# --------------------------------------------------------------------------
+# Wire-contract integrity: an id must never hand back the wrong KIND of thing
+
+
+def test_content_on_an_unstarted_ticket_is_refused_not_answered_with_json(bal, fleet):
+    """THE corrupt-deliverable path: the ticket branch matched every q_ path
+    including /content, so a client fetching early streamed a JSON status
+    body into its .mp4, renamed it, and recorded a successful deliverable.
+    There is no 2xx that a body-shaped answer is correct for here."""
+    with TestClient(bal.app) as client:
+        _submit(client)
+        _submit(client)
+        ticket = _submit(client, prompt="queued").json()["id"]
+        assert ticket.startswith("q_")
+        r = client.get(f"/v1/videos/{ticket}/content")
+    assert r.status_code == 409, "no artifact exists yet"
+    assert r.content[:4] != b'{"id', "and certainly not a status body"
+
+
+def test_the_effective_id_header_is_absent_on_error_responses(bal, fleet):
+    """Stamping it on a replica's 404 told the gateway 'this fleet owns the
+    job' about the fleet that had just denied it — and the gateway caches
+    that until a 502, so one 404 poisoned the mapping for good."""
+    with TestClient(bal.app) as client:
+        job = _submit(client).json()
+        ok = client.get(f"/v1/videos/{job['id']}")
+        assert ok.headers.get("x-deepme-job-id") == job["id"]
+        fleet.jobs.pop(job["id"])
+        gone = client.get(f"/v1/videos/{job['id']}")
+    assert gone.status_code >= 400
+    assert "x-deepme-job-id" not in gone.headers
+
+
+def test_a_ticket_whose_job_still_runs_is_never_pruned(bal, fleet):
+    """The platform promises the handed-out id keeps working. Dropping a
+    SUBMITTED ticket mid-generation turned that promise into a 404, which
+    the client reads as a lost ticket and resubmits — billing twice."""
+    with TestClient(bal.app) as client:
+        a = _submit(client).json()
+        b = _submit(client).json()
+        ticket = _submit(client, prompt="queued").json()["id"]
+        fleet.complete(a["id"])
+        client.get(f"/v1/videos/{a['id']}")  # frees a slot -> pump -> handover
+        # Prune aggressively; the ticket's job is running, so it must stay.
+        bal.admission.prune(keep=0, live_jobs={j for j, _u, _t, _c in bal.bal.open_jobs()})
+        still = client.get(f"/v1/videos/{ticket}")
+        assert still.status_code == 200, "the id the caller holds still works"
+        # A ticket with NO live job is fair game.
+        fleet.complete(b["id"])
+        client.get(f"/v1/videos/{b['id']}")
+        bal.admission.prune(keep=0, live_jobs=set())
+    assert bal.admission.get(ticket) is None
+
+
+def test_a_proxied_read_never_holds_a_replica_slot(bal, fleet):
+    """Reserving for every method meant a non-job-scoped GET against a
+    wedged replica parked forever holding a reservation nothing released:
+    free_slots() dropped permanently, and since admission delegates to it,
+    the queue stopped draining on an idle fleet with nothing counted."""
+    with TestClient(bal.app) as client:
+        before = client.get("/v1/capacity").json()["free"]
+        # A read that is not job-scoped and not a POST.
+        client.get("/v1/models")
+        after = client.get("/v1/capacity").json()["free"]
+    assert after == before, "no slot was consumed by a read"
+    stats = {s["url"]: s for s in bal.bal.snapshot()["backends"]}
+    assert all(s["failed"] == 0 for s in stats.values()), (
+        "a proxied read's status must not count as a job failure"
+    )
+
+
+def test_strikes_do_not_leak_for_jobs_closed_elsewhere(bal, fleet):
+    """Strike entries were removed only on threshold or a healthy answer, so
+    a job closed by a client poll / SSE / DELETE left its counter behind
+    forever — an unbounded dict, and stale strikes re-applied to a recycled
+    id."""
+    with TestClient(bal.app) as client:
+        job = _submit(client).json()
+        bal._job_strikes[job["id"]] = 3  # partway to the threshold
+        fleet.complete(job["id"])
+        client.get(f"/v1/videos/{job['id']}")  # closed by the CLIENT
+        asyncio.run(bal._reap_stale_jobs())
+    assert job["id"] not in bal._job_strikes
+
+
+def test_a_strike_close_reports_a_documented_status_with_its_reason(bal, fleet):
+    """ "lost" was minted as a fifth terminal status that no consumer knows;
+    the nuance belongs in closed_by/reason, which are fields."""
+    with TestClient(bal.app) as client:
+        job = _submit(client).json()
+        for _ in range(bal.JOB_LOST_STRIKES):
+            bal._strike(job["id"], R1, "unknown to its replica")
+        body = client.get("/v1/jobs").json()
+    recent = body["recent"][0]
+    assert recent["status"] == "failed", "one of the documented four"
+    assert recent["closed_by"] == "strikes"
+    assert recent["reason"] == "unknown to its replica"
+
+
+def test_stats_reports_maintenance_health_and_queue_depth(bal, fleet):
+    """A dead maintenance loop looks exactly like a healthy idle one. The
+    counters existed but lived only in /metrics, which no command reads —
+    so in practice nobody could see them."""
+    bal.maintenance_errors = 2
+    bal.retention_errors = 1
+    with TestClient(bal.app) as client:
+        _submit(client)
+        _submit(client)
+        _submit(client, prompt="queued")  # ticket
+        snap = client.get("/balancer/stats").json()
+    assert snap["maintenance"]["errors_total"] == 2
+    assert snap["maintenance"]["retention_errors_total"] == 1
+    assert snap["maintenance"]["boot"] == bal.BOOT_ID
+    assert "audit_enabled" in snap["maintenance"]
+    assert snap["queue"]["waiting"] == 1, "queue depth without curling for it"
+
+
+def test_control_plane_routes_require_the_platform_key(bal, fleet, monkeypatch):
+    """These routes CHANGE THE FLEET and were reachable by anyone who could
+    talk to the port, which binds 0.0.0.0 — a single unauthenticated DELETE
+    could tear the fleet down."""
+    monkeypatch.setattr(bal, "API_KEY", "secret-key")
+    with TestClient(bal.app) as client:
+        assert client.get("/balancer/stats").status_code == 401
+        assert client.post("/balancer/backends", json={"url": R1}).status_code == 401
+        assert client.request("DELETE", "/balancer/backends", params={"url": R1}).status_code == 401
+        good = {"Authorization": "Bearer secret-key"}
+        assert client.get("/balancer/stats", headers=good).status_code == 200
+        # The DATA plane is deliberately NOT gated: it forwards the caller's
+        # own credentials onward, and gating it would break the service layer.
+        assert client.get("/v1/capacity").status_code == 200
+
+
+def test_control_plane_is_open_when_no_key_is_configured(bal, fleet):
+    """A local/dev deployment with no key configured is unchanged."""
+    with TestClient(bal.app) as client:
+        assert client.get("/balancer/stats").status_code == 200

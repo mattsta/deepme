@@ -34,9 +34,18 @@ _SAFE_SUBFOLDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _SAFE_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+class ProfileError(Exception):
+    """A profile cannot be selected, found or parsed.
+
+    An ordinary exception: this is a library, and a caller surveying many
+    profiles must be able to skip a bad one without catching
+    BaseException. The CLI turns it into an exit code at its boundary.
+    """
+
+
 def _validate_name(name: str) -> str:
     if not _SAFE_NAME.match(name):
-        raise SystemExit(
+        raise ProfileError(
             f"invalid profile name {name!r}: allowed chars are letters, "
             "digits, dot, underscore, hyphen (must start alphanumeric)"
         )
@@ -247,16 +256,36 @@ def list_profiles() -> list[str]:
     return sorted(p.stem for p in PROFILES_DIR.glob("*.toml"))
 
 
+def diffusion_profiles() -> list[str]:
+    """Profiles that can generate media, read from DISK ONLY.
+
+    Deliberately does not go through `load()`: that resolves Hugging Face
+    metadata over the network (30s uncached) to determine `kind`, which is
+    absurd cost for "which profiles could the user have meant?" — a question
+    asked precisely when the command is already known to be wrong. A
+    diffusion profile is one that declares generation `tasks` or a
+    `[generate]` block; a text profile declares neither.
+    """
+    out = []
+    for path in sorted(PROFILES_DIR.glob("*.toml")):
+        try:
+            data = tomllib.loads(path.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if data.get("tasks") or data.get("generate"):
+            out.append(path.stem)
+    return out
+
+
 def default_profile() -> str | None:
-    cfg = config._file_config()
-    return cfg.get("model", {}).get("default") or (
+    return config.section("model").get("default") or (
         list_profiles()[0] if len(list_profiles()) == 1 else None
     )
 
 
 def set_default_profile(name: str) -> None:
     if name not in list_profiles():
-        raise SystemExit(f"unknown profile {name!r}; available: {list_profiles()}")
+        raise ProfileError(f"unknown profile {name!r}; available: {list_profiles()}")
     config.update_config("model", default=name)
 
 
@@ -265,17 +294,23 @@ def load(name: str | None = None, **overrides) -> RunSpec:
 
     Overrides use RunSpec field names; None values are ignored, so CLI
     options can be passed through unconditionally.
+
+    Raises ProfileError — never SystemExit. Callers that survey MANY
+    profiles (fleet status, top) have to tolerate one unloadable profile,
+    and they were doing it with `suppress(Exception, SystemExit)`, which
+    also swallowed the interrupt protocol's own escalation: a ^C landing
+    inside a watch loop's per-profile load was silently discarded.
     """
     name = name or default_profile()
     if not name:
-        raise SystemExit(
+        raise ProfileError(
             f"no model profile selected — pass -m/--model or run: "
             f"uv run deepme model use <name>  (available: {list_profiles()})"
         )
     _validate_name(name)
     path = PROFILES_DIR / f"{name}.toml"
     if not path.exists():
-        raise SystemExit(f"unknown profile {name!r}; available: {list_profiles()}")
+        raise ProfileError(f"unknown profile {name!r}; available: {list_profiles()}")
     raw = tomllib.loads(path.read_text())
     model, serve_c = raw.get("model", {}), raw.get("serve", {})
     sampling = raw.get("sampling", {})
@@ -286,20 +321,20 @@ def load(name: str | None = None, **overrides) -> RunSpec:
     meta = hfmeta.get(model["repo"])
     variant = str(model.get("variant", ""))
     if variant and not _SAFE_VARIANT.match(variant):
-        raise SystemExit(f"invalid gguf variant path {variant!r} in profile {name!r}")
+        raise ProfileError(f"invalid gguf variant path {variant!r} in profile {name!r}")
     # Unit environment: systemd takes one KEY=VALUE per line, so a newline in
     # either half would inject directives into the generated unit.
     env_raw = serve_c.get("env", {})
     for k, v in env_raw.items():
         if not _SAFE_ENV_KEY.match(k) or "\n" in str(v):
-            raise SystemExit(
+            raise ProfileError(
                 f"invalid [serve.env] entry {k!r} in profile {name!r}: keys must "
                 "be A-Z/0-9/underscore and values single-line"
             )
     env = tuple((str(k), str(v)) for k, v in sorted(env_raw.items()))
     subfolder = str(ov.get("subfolder", model.get("subfolder", "")))
     if subfolder and (not _SAFE_SUBFOLDER.match(subfolder) or ".." in subfolder.split("/")):
-        raise SystemExit(
+        raise ProfileError(
             f"invalid subfolder {subfolder!r} in profile {name!r}: must be a "
             "repo-relative directory (no leading slash, no '..')"
         )
@@ -322,7 +357,7 @@ def load(name: str | None = None, **overrides) -> RunSpec:
                 policy.full_model_variants(meta.gguf_variants, meta.total_params)
             )
             if not allowed:
-                raise SystemExit(
+                raise ProfileError(
                     f"{meta.repo}: no gguf variant satisfies the quant policy "
                     f"(min {policy.current().min_gguf_bits:g}-bit) — set an "
                     "explicit `variant` in the profile to override"

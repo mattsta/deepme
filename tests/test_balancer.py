@@ -277,3 +277,32 @@ def test_a_job_that_is_genuinely_running_is_never_reaped():
     b.begin_job("vid_1", URLS[0])
     began = b._jobs["vid_1"][1]
     assert b.stale_jobs(now=began + 60) == []
+
+
+def test_only_the_first_close_of_a_job_reports_true():
+    """end_job's return is the terminal-accounting dedupe: client poll, SSE
+    watcher and reconciler all see the same terminal status, and only the
+    first closer may record it — double-noting put every job in the recent
+    ring twice, the second entry stripped of its metadata."""
+    b = Balancer(list(URLS))
+    b.begin_job("vid_1", URLS[0])
+    assert b.end_job("vid_1") is True
+    assert b.end_job("vid_1") is False, "already closed: not yours to record"
+    assert b.end_job("vid_never_started") is False
+    assert b.stats[URLS[0]].completed == 1, "counted exactly once"
+
+
+def test_owner_eviction_spares_open_jobs_and_refreshes_hot_ids():
+    """An open job's owner is load-bearing routing — evicting it sent the
+    next poll through the owner probe, the misattribution trigger. And
+    recency, not first-seen order, decides who ages out."""
+    b = Balancer(list(URLS))
+    b.max_jobs = 2
+    b.begin_job("vid_open", URLS[0])  # open: also remembered
+    b.remember("vid_done", URLS[1])
+    # Re-remembering refreshes: vid_done is now most recent.
+    b.remember("vid_done", URLS[1])
+    b.remember("vid_new", URLS[2])  # over cap: must evict a CLOSED id
+    assert b.owner("vid_open") == URLS[0], "open jobs are never evicted"
+    assert b.owner("vid_new") == URLS[2]
+    assert b.owner("vid_done") is None, "the least-recent closed id went"

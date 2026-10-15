@@ -8,6 +8,11 @@ pricing/economics, artifact retention, and full operator observability
 (`top`, `capacity`, `events`, Prometheus `/metrics`) — alongside
 OpenAI-compatible text-LLM serving. One CLI drives all of it.
 
+**See it in action:** the clips in the gallery at
+<https://matt.sh/apps/facetious/propaganda/> were generated with this
+repository and the MiniMax-H3 video profiles in `deploy/models/`
+(`h3-video`, `h3-ref`).
+
 **A model = one profile file** (`deploy/models/<name>.toml`) declaring the HF
 repo and serving intent (engine, GPUs, port, context, memory). Everything
 knowable from an API is auto-fetched, never hand-written: weight sizes and
@@ -46,6 +51,32 @@ uv run deepme bench -m <profile> -c 1 -c 4  # benchmark
 
 `deepme model use <name>` persists a default profile so `-m` can be omitted
 everywhere. Every step is idempotent.
+
+## Restart / redeploy the running platform
+
+After changing a profile's `[serve.env]` or `engine_args`, the
+balancer/gateway source, or the port registry. **Bottom-up, always:**
+
+```sh
+uv run deepme capacity                                # what is running now
+uv run deepme serve scale -m h3-video -n 4 --force    # 1. replicas (~6 min)
+uv run deepme balancer start -m h3-video --force      # 2. balancer
+uv run deepme gateway start                           # 3. gateway
+uv run deepme capacity && uv run deepme top           # verify
+```
+
+**`serve restart` does not apply env or engine-arg changes** — it is a bare
+`systemctl restart` and reuses the unit file those values are frozen into.
+Only `serve scale`/`serve start` re-render the unit, so the wrong command
+looks successful and changes nothing.
+
+`--force` overrides the drain guard that refuses to stop replicas with work
+in flight; omit it unless you mean to kill running generations. Restarting a
+balancer discards **waiting queue tickets** (in-memory) — running jobs
+survive on their replicas and are re-adopted, and clients holding a ticket
+resubmit themselves. Full detail, including narrower operations and the
+fleet-mix path that avoids a restart entirely, in
+[docs/RUNBOOK.md](docs/RUNBOOK.md) §0.
 
 ## Browsing & picking models interactively
 
@@ -469,6 +500,11 @@ on four replicas that is roughly **17 clips/hour, ~170 overnight**.
 Each item records the server-reported peak VRAM, which is how the request
 envelope below was measured.
 
+`--fetch-existing` winds a batch down instead of continuing it: items that
+already own a server job are adopted and downloaded, nothing new is
+submitted (a lost job is marked failed, never regenerated), and the pending
+backlog stays parked for a later run without the flag.
+
 ## Story: chained continuation
 
 H3's `fl2va` task pins an image to a chosen frame, so one clip's final frame
@@ -637,53 +673,53 @@ installed via `deepme setup -e llamacpp`).
 
 ## Commands
 
-| command                                                       | what it does                                                                                              |
-| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `model list\|show\|use\|add\|refresh\|variants`               | manage profiles (facts from HF API); `variants` picks a GGUF quant                                        |
-| `browse [--all] [--limit N]`                                  | interactive picker: HF trending x engine support x cluster fit                                            |
-| `runs` / `runs show <id>`                                     | deployment/bench ledger (history, full specs, outcomes)                                                   |
-| `check [--fix] [--types]`                                     | quality gate: ruff + pytest in ~2s; `--types` adds mypy (slow on 3.14t)                                   |
-| `resources [--refresh]`                                       | capacity, live claims per unit, free GPU/CPU/RAM                                                          |
-| `config init\|show`                                           | target server (local, gitignored)                                                                         |
-| `status`                                                      | fleet view: GPUs, disk, all units, per-profile API health                                                 |
-| `gpu-fix`                                                     | driver stack: -open module, version alignment, reload                                                     |
-| `setup [-e ...]`                                              | build tools + engine uv projects (idempotent)                                                             |
-| `versions`                                                    | engine/toolchain versions per project                                                                     |
-| `gpus` / `reclaim [--kill]`                                   | GPU processes / kill non-deepme GPU processes (lists by default)                                          |
-| `switch <profile>`                                            | one-command model switch: fit-check → auto-download → stop conflicts → deploy → health → completion proof |
-| `download start\|restart\|status [-m P]`                      | resumable weight download                                                                                 |
-| `serve start\|stop\|restart\|status\|wait\|diag\|logs [-m P]` | service lifecycle                                                                                         |
-| `doctor [-e engine]`                                          | probe engine-critical imports, full tracebacks                                                            |
-| `jit-heal`                                                    | serially finish raced flashinfer JIT builds                                                               |
-| `test [-m P] [--pad-tokens N]`                                | one completion + timing + cache usage                                                                     |
-| `test-tools [-m P]`                                           | verify structured tool_calls/reasoning output                                                             |
-| `bench [-m P] -c N... [--out f.json]`                         | TTFT + throughput sweep                                                                                   |
-| `serve scale -m P -n N`                                       | run N replicas across free GPUs (first staggered, rest parallel)                                          |
-| `balancer start\|stop\|status [-m P]`                         | one API in front of N replicas; per-replica load                                                          |
-| `generate [-m P] "prompt" [--direct]`                         | one video via the best front end (gateway → balancer → replica); live step/ETA progress                   |
-| `batch run <file> [-m P]` / `batch status <name>`             | unattended backlog, resumable, one in flight per replica                                                  |
-| `story run <file> [-m P]` / `story join <name>`               | chained clips, each seeded by the previous last frame                                                     |
-| `showcase list\|run [-m P]`                                   | demo reel: concurrent proof that leaves assets behind                                                     |
-| `plan [--repo R]`                                             | what fits in the FREE space right now, and where                                                          |
-| `memprofile [-m P]`                                           | host RAM per component vs measured RSS/PSS                                                                |
-| `store status\|clear`                                         | shared weight store (/dev/shm) usage and cleanup                                                          |
-| `patches status\|apply\|revert\|install-hooks\|record`        | vendored engine changes + upgrade staleness detection                                                     |
-| `watch [-i N]`                                                | sample every deployment; log up/down transitions to the ledger                                            |
-| `fleet list\|plan\|status\|switch\|apply`                     | declared mixes; `switch` resizes live by delta (drains, re-attaches, converges on re-run)                 |
-| `gateway start\|stop\|status`                                 | one address in front of every fleet: model+task routing, capacity, pricing                                |
-| `capacity [--watch] [--json]`                                 | the scheduling signal: free slots, queues, running jobs, disk — what an app-layer scheduler polls         |
-| `top [--watch] [--json]`                                      | operator view of EVERY job: prompt/task/stage/step-countdown, queue positions, recent outcomes            |
-| `events [--raw]`                                              | subscribe to the platform firehose: every job/fleet transition pushed live (SSE), fleet-tagged            |
-| `discover [--json]`                                           | service catalog: models, tasks, every endpoint declared-vs-running                                        |
-| `econ [--json] [--record-duration B]`                         | costs, floors, mixes, surge — derived from economics.toml + measurements, with live drift warnings        |
-| `job-progress <id> [-m P]`                                    | one job's live stage via the exact chain every progress display uses                                      |
-| `artifacts audit\|sweep [-m P]`                               | server-side generated files: usage view; manual TTL sweep (dry-run default) over the automatic retention  |
-| `batch list`                                                  | every batch on disk with its counts                                                                       |
-| `ports [--check]`                                             | the declared port registry; exits non-zero on any overlap                                                 |
-| `engines` / `upgrade-preview -e E`                            | engine capability matrix / what an upgrade would pull, resolved offline                                   |
-| `guard setup\|start\|stop\|status\|test`                      | output-guard proxy lifecycle and live adversarial verification                                            |
-| `reboot [--force]`                                            | reboot server (refuses while generations run; confirmed; ledgered)                                        |
-| `ssh "cmd"`                                                   | escape hatch (one-time inspection only)                                                                   |
+| command                                                       | what it does                                                                                                         |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `model list\|show\|use\|add\|refresh\|variants`               | manage profiles (facts from HF API); `variants` picks a GGUF quant                                                   |
+| `browse [--all] [--limit N]`                                  | interactive picker: HF trending x engine support x cluster fit                                                       |
+| `runs` / `runs show <id>`                                     | deployment/bench ledger (history, full specs, outcomes)                                                              |
+| `check [--fix] [--types]`                                     | quality gate: ruff + pytest in ~2s; `--types` adds mypy (slow on 3.14t)                                              |
+| `resources [--refresh]`                                       | capacity, live claims per unit, free GPU/CPU/RAM                                                                     |
+| `config init\|show`                                           | target server (local, gitignored)                                                                                    |
+| `status`                                                      | fleet view: GPUs, disk, all units, per-profile API health                                                            |
+| `gpu-fix`                                                     | driver stack: -open module, version alignment, reload                                                                |
+| `setup [-e ...]`                                              | build tools + engine uv projects (idempotent)                                                                        |
+| `versions`                                                    | engine/toolchain versions per project                                                                                |
+| `gpus` / `reclaim [--kill]`                                   | GPU processes / kill non-deepme GPU processes (lists by default)                                                     |
+| `switch <profile>`                                            | one-command model switch: fit-check → auto-download → stop conflicts → deploy → health → completion proof            |
+| `download start\|restart\|status [-m P]`                      | resumable weight download                                                                                            |
+| `serve start\|stop\|restart\|status\|wait\|diag\|logs [-m P]` | service lifecycle                                                                                                    |
+| `doctor [-e engine]`                                          | probe engine-critical imports, full tracebacks                                                                       |
+| `jit-heal`                                                    | serially finish raced flashinfer JIT builds                                                                          |
+| `test [-m P] [--pad-tokens N]`                                | one completion + timing + cache usage                                                                                |
+| `test-tools [-m P]`                                           | verify structured tool_calls/reasoning output                                                                        |
+| `bench [-m P] -c N... [--out f.json]`                         | TTFT + throughput sweep                                                                                              |
+| `serve scale -m P -n N`                                       | run N replicas across free GPUs (first staggered, rest parallel)                                                     |
+| `balancer start\|stop\|status [-m P]`                         | one API in front of N replicas; per-replica load                                                                     |
+| `generate [-m P] "prompt" [--direct]`                         | one video via the best front end (gateway → balancer → replica); live step/ETA progress                              |
+| `batch run <file> [-m P]` / `batch status <name>`             | unattended backlog, resumable, one in flight per replica; `--fetch-existing` collects owned jobs and submits nothing |
+| `story run <file> [-m P]` / `story join <name>`               | chained clips, each seeded by the previous last frame                                                                |
+| `showcase list\|run [-m P]`                                   | demo reel: concurrent proof that leaves assets behind                                                                |
+| `plan [--repo R]`                                             | what fits in the FREE space right now, and where                                                                     |
+| `memprofile [-m P]`                                           | host RAM per component vs measured RSS/PSS                                                                           |
+| `store status\|clear`                                         | shared weight store (/dev/shm) usage and cleanup                                                                     |
+| `patches status\|apply\|revert\|install-hooks\|record`        | vendored engine changes + upgrade staleness detection                                                                |
+| `watch [-i N]`                                                | sample every deployment; log up/down transitions to the ledger                                                       |
+| `fleet list\|plan\|status\|switch\|apply`                     | declared mixes; `switch` resizes live by delta (drains, re-attaches, converges on re-run)                            |
+| `gateway start\|stop\|status`                                 | one address in front of every fleet: model+task routing, capacity, pricing                                           |
+| `capacity [--watch] [--json]`                                 | the scheduling signal: free slots, queues, running jobs, disk — what an app-layer scheduler polls                    |
+| `top [--watch] [--json]`                                      | operator view of EVERY job: prompt/task/stage/step-countdown, queue positions, recent outcomes                       |
+| `events [--raw]`                                              | subscribe to the platform firehose: every job/fleet transition pushed live (SSE), fleet-tagged                       |
+| `discover [--json]`                                           | service catalog: models, tasks, every endpoint declared-vs-running                                                   |
+| `econ [--json] [--record-duration B]`                         | costs, floors, mixes, surge — derived from economics.toml + measurements, with live drift warnings                   |
+| `job-progress <id> [-m P]`                                    | one job's live stage via the exact chain every progress display uses                                                 |
+| `artifacts audit\|sweep [-m P]`                               | server-side generated files: usage view; manual TTL sweep (dry-run default) over the automatic retention             |
+| `batch list`                                                  | every batch on disk with its counts                                                                                  |
+| `ports [--check]`                                             | the declared port registry; exits non-zero on any overlap                                                            |
+| `engines` / `upgrade-preview -e E`                            | engine capability matrix / what an upgrade would pull, resolved offline                                              |
+| `guard setup\|start\|stop\|status\|test`                      | output-guard proxy lifecycle and live adversarial verification                                                       |
+| `reboot [--force]`                                            | reboot server (refuses while generations run; confirmed; ledgered)                                                   |
+| `ssh "cmd"`                                                   | escape hatch (one-time inspection only)                                                                              |
 
 ## Layout
 

@@ -21,8 +21,20 @@ import json
 import os
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+# Shared with the balancer — see proxycore's docstring for why the owner
+# probe must not be maintained twice. Deployed next to this file too.
+from proxycore import (
+    AmbiguousOwner,
+    auth_headers,
+    content_headers,
+    find_owner,
+    is_content,
+    job_id_of,
+    safe_headers,
+)
 from route import RoutingError, build  # deployed next to this file
 
 ROUTES = json.loads(os.environ.get("GATEWAY_ROUTES", "[]"))
@@ -32,32 +44,63 @@ PRICING = json.loads(os.environ.get("GATEWAY_PRICING", "{}"))
 API_KEY = os.environ.get("GATEWAY_API_KEY", "")
 # A generation runs for minutes; only connecting should be quick.
 TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=None, pool=None)
+# Control-plane reads (capacity, jobs, queue, metrics, health, owner probes)
+# are sub-second against a healthy balancer and MUST be bounded AND pooled
+# apart from proxied traffic: a multi-hundred-MB /content download holding
+# the shared pool made /v1/capacity time out, the gateway reported the fleet
+# unreachable inside a 200, and clients read that as proof their (running,
+# about-to-complete) jobs were gone — false stall verdicts, exactly while
+# results were being fetched.
+CTL_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 
-app = FastAPI()
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    """Own the HTTP clients' lifetime.
+
+    The gateway had no lifespan at all, so its pooled connections were
+    never closed on shutdown — torn down abruptly instead of gracefully,
+    and with no place to put any future startup invariant.
+    """
+    yield
+    await client.aclose()
+    await ctl.aclose()
+
+
+app = FastAPI(lifespan=_lifespan)
 table = build(ROUTES)
 client = httpx.AsyncClient(timeout=TIMEOUT)
-
-_COLLECTIONS = ("videos", "images", "meshes")
-
-
-def _auth(request: Request) -> dict[str, str]:
-    incoming = request.headers.get("authorization")
-    if incoming:
-        return {"authorization": incoming}
-    return {"authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+ctl = httpx.AsyncClient(timeout=CTL_TIMEOUT)
 
 
-def _job_id(path: str) -> str | None:
-    parts = [p for p in path.split("/") if p]
-    for i, part in enumerate(parts):
-        if part in _COLLECTIONS and i + 1 < len(parts):
-            return parts[i + 1]
-    return None
+def _log(message: str) -> None:
+    """One line to the journal, for things an operator will be asked about.
+
+    This service used to print NOTHING — no routing refusal, no vanished
+    job, no unreachable fleet left any trace, so "my job disappeared" was
+    unanswerable without reproducing it. stdout, because systemd captures
+    it and `deepme gateway logs` reads it back.
+    """
+    print(f"gateway: {message}", flush=True)
 
 
-def _safe_headers(headers) -> dict[str, str]:
-    drop = {"content-length", "content-encoding", "transfer-encoding", "connection"}
-    return {k: v for k, v in headers.items() if k.lower() not in drop}
+def require_key(request: Request) -> None:
+    """Gate the CONTROL PLANE (/gateway/reload, /gateway/routes).
+
+    `/gateway/reload` can repoint every model at an arbitrary URL — prompts
+    and results included — and it was reachable by anyone who could talk to
+    the port, which binds 0.0.0.0. `/v1/*` stays ungated on purpose: it
+    forwards the CALLER's credentials onward, and gating it here would
+    break the service layer's own auth. `/gateway/discover` likewise stays
+    open — it is the documented call a service layer makes to find us.
+
+    Off when no key is configured, so a local/dev deployment is unchanged.
+    """
+    if not API_KEY:
+        return
+    header = request.headers.get("authorization", "")
+    if header.removeprefix("Bearer ").strip() != API_KEY:
+        raise HTTPException(status_code=401, detail="control-plane routes require the platform key")
 
 
 CATALOG = json.loads(os.environ.get("GATEWAY_CATALOG", "{}"))
@@ -74,7 +117,7 @@ async def discover() -> JSONResponse:
     return JSONResponse(CATALOG)
 
 
-@app.post("/gateway/reload")
+@app.post("/gateway/reload", dependencies=[Depends(require_key)])
 async def reload_state(request: Request) -> JSONResponse:
     """Re-point routes/catalog/pricing IN PLACE — no restart.
 
@@ -109,7 +152,7 @@ async def reload_state(request: Request) -> JSONResponse:
     )
 
 
-@app.get("/gateway/routes")
+@app.get("/gateway/routes", dependencies=[Depends(require_key)])
 async def routes() -> JSONResponse:
     """What is deployed and what each fleet can serve.
 
@@ -134,7 +177,7 @@ async def health() -> JSONResponse:
 
     async def up(route) -> bool:
         try:
-            r = await client.get(f"{route.url}/health", timeout=3)
+            r = await ctl.get(f"{route.url}/health", timeout=3)
             return bool(r.status_code < 500)
         except httpx.HTTPError:
             return False
@@ -192,7 +235,7 @@ async def _fleet_capacity(route) -> dict:
         "url": route.url,
     }
     try:
-        r = await client.get(f"{route.url}/v1/capacity")
+        r = await ctl.get(f"{route.url}/v1/capacity")
         r.raise_for_status()
         entry.update(dict(r.json()), reachable=True)
     except (httpx.HTTPError, ValueError):
@@ -333,6 +376,22 @@ async def event_firehose(request: Request) -> Response:
         limit = int(request.query_params.get("limit") or 0)
     out: asyncio.Queue = asyncio.Queue(maxsize=512)
 
+    def emit(evt: dict) -> None:
+        """Never block the fleet pump on a slow subscriber.
+
+        `await out.put(...)` on a bounded queue back-pressured this pump,
+        which stopped draining the balancer's stream, which filled the
+        balancer's own subscriber queue — the exact opposite of the
+        platform's stated policy. The balancer drops oldest and marks a
+        `gap`; the mux now does the same, so the two agree.
+        """
+        try:
+            out.put_nowait(evt)
+        except asyncio.QueueFull:
+            with contextlib.suppress(Exception):
+                out.get_nowait()
+                out.put_nowait({"type": "gap", "fleet": evt.get("fleet")})
+
     async def pump_fleet(route) -> None:
         while True:
             try:
@@ -343,10 +402,17 @@ async def event_firehose(request: Request) -> Response:
                         with contextlib.suppress(ValueError, TypeError):
                             evt = json.loads(line[len("data: ") :])
                             evt["fleet"] = route.profile
-                            await out.put(evt)
+                            emit(evt)
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                await out.put({"type": "fleet_down", "fleet": route.profile})
-                await asyncio.sleep(5)
+                emit({"type": "fleet_down", "fleet": route.profile})
+            # Backoff on EVERY iteration, not just the error path: a stream
+            # that ends cleanly (a graceful balancer shutdown, a `limit`
+            # tap finishing, a proxy closing an idle connection) sent this
+            # loop straight back to reconnect, hammering the balancer with
+            # one full HTTP request per iteration.
+            await asyncio.sleep(5)
 
     async def stream():
         tasks = [asyncio.create_task(pump_fleet(r)) for r in table.routes]
@@ -385,7 +451,7 @@ async def jobs() -> JSONResponse:
             "recent": [],
         }
         try:
-            r = await client.get(f"{route.url}/v1/jobs")
+            r = await ctl.get(f"{route.url}/v1/jobs")
             r.raise_for_status()
             entry.update(dict(r.json()))
         except (httpx.HTTPError, ValueError):
@@ -404,9 +470,12 @@ async def gw_metrics() -> Response:
 
     async def one(route):
         try:
-            r = await client.get(f"{route.url}/metrics")
+            r = await ctl.get(f"{route.url}/metrics")
             r.raise_for_status()
-            out = []
+            # A POSITIVE signal, not only the negative one. Only
+            # deepme_fleet_up=0 was ever emitted, so a scrape could never
+            # distinguish "healthy" from "this fleet was never scraped".
+            out = [f'deepme_fleet_up{{fleet="{route.profile}"}} 1']
             for line in r.text.splitlines():
                 if line.startswith("#") or not line.strip():
                     out.append(line)
@@ -443,14 +512,14 @@ async def queue() -> JSONResponse:
     # capable fleet, keeping per-fleet queues for the rest; the gateway would
     # then need the drain loop and ticket routes the balancer already has, and
     # `resolve()` would return a set of candidate fleets instead of one.
-    fleets, waiting = [], 0
-    for route in table.routes:
+    import asyncio
+
+    async def one(route) -> dict:
         entry = {"profile": route.profile, "tasks": sorted(route.tasks)}
         try:
-            r = await client.get(f"{route.url}/v1/queue")
+            r = await ctl.get(f"{route.url}/v1/queue")
             r.raise_for_status()
             entry.update(dict(r.json()), reachable=True)
-            waiting += int(entry.get("waiting") or 0)
         except (httpx.HTTPError, ValueError):
             # Report it as unreachable rather than omitting it: a fleet that
             # is down is not a fleet with an empty queue. `waiting: 0` is
@@ -458,14 +527,20 @@ async def queue() -> JSONResponse:
             # case a client is being taught to handle — with `reachable`
             # saying why the zero cannot be trusted.
             entry.update(waiting=0, reachable=False)
-        fleets.append(entry)
+        return entry
+
+    # CONCURRENTLY, like every sibling endpoint here. Sequentially, each
+    # unreachable fleet added a full CTL_TIMEOUT to the response, so this
+    # one call degraded linearly where /v1/jobs stayed flat.
+    fleets = list(await asyncio.gather(*(one(r) for r in table.routes)))
+    waiting = sum(int(f.get("waiting") or 0) for f in fleets)
     return JSONResponse({"waiting": waiting, "fleets": fleets})
 
 
 @app.delete("/v1/queue/{ticket_id}")
 async def cancel(ticket_id: str, request: Request) -> Response:
     """Cancel a ticket without the caller knowing which fleet holds it."""
-    headers = _auth(request)
+    headers = auth_headers(request, API_KEY)
     path = f"/v1/queue/{ticket_id}"
     # Normally remembered from the 202 that minted it. The fallback probes
     # "/v1/videos/{ticket}" — the path a balancer actually answers for a
@@ -476,7 +551,8 @@ async def cancel(ticket_id: str, request: Request) -> Response:
     if target is None:
         return JSONResponse({"detail": f"no fleet holds ticket {ticket_id}"}, status_code=404)
     try:
-        r = await client.delete(f"{target}{path}", headers=headers)
+        # A cancel is control plane: bounded, like every other one.
+        r = await ctl.delete(f"{target}{path}", headers=headers)
     except httpx.HTTPError as exc:
         return JSONResponse({"detail": f"fleet unreachable: {exc}"}, status_code=502)
     if r.status_code < 400:
@@ -484,7 +560,7 @@ async def cancel(ticket_id: str, request: Request) -> Response:
     return Response(
         content=r.content,
         status_code=r.status_code,
-        headers=_safe_headers(r.headers),
+        headers=safe_headers(r.headers),
         media_type=r.headers.get("content-type"),
     )
 
@@ -492,15 +568,29 @@ async def cancel(ticket_id: str, request: Request) -> Response:
 @app.api_route("/{path:path}", methods=["GET", "POST", "DELETE"])
 async def proxy(path: str, request: Request) -> Response:
     full = "/" + path
-    headers = _auth(request)
+    headers = auth_headers(request, API_KEY)
     body = await request.body()
 
     # An existing job goes back to the fleet that minted its id, always.
-    job_id = _job_id(full)
+    job_id = job_id_of(full)
     if job_id and request.method in ("GET", "DELETE"):
         remembered = table.owner(job_id)
-        target = remembered or await _find_owner(job_id, full, headers)
+        try:
+            target = remembered or await _find_owner(job_id, full, headers)
+        except AmbiguousOwner:
+            # CONFLICT, not absence: the id exists in more than one place,
+            # or may. 404 here would tell the caller it is unknown and safe
+            # to resubmit, doubling a billable generation.
+            return JSONResponse(
+                {"detail": f"job {job_id} is claimed by more than one fleet — refusing to guess"},
+                status_code=409,
+            )
         if target is None:
+            # LOUD. "My job vanished" is the report an operator gets, and
+            # this line is the only place that can explain it — the gateway
+            # wrote nothing at all before, so a refusal here left no trace
+            # anywhere in the system.
+            _log(f"no fleet holds job {job_id} ({request.method} {full})")
             return JSONResponse({"detail": f"no fleet holds job {job_id}"}, status_code=404)
         streamed = await _stream(target, full, request, headers, body)
         if streamed.status_code == 502 and remembered:
@@ -509,8 +599,15 @@ async def proxy(path: str, request: Request) -> Response:
             # 502s forever (the contract says 502 is retryable): forget it,
             # probe afresh, and if nobody holds the job say so honestly.
             table.forget(job_id)
-            fresh = await _find_owner(job_id, full, headers)
+            try:
+                fresh = await _find_owner(job_id, full, headers)
+            except AmbiguousOwner:
+                return JSONResponse(
+                    {"detail": f"job {job_id} is claimed by more than one fleet"},
+                    status_code=409,
+                )
             if fresh is None:
+                _log(f"job {job_id} gone: remembered fleet {remembered} is unreachable")
                 return JSONResponse(
                     {"detail": f"job {job_id} is gone — the fleet that held it no longer exists"},
                     status_code=404,
@@ -518,7 +615,12 @@ async def proxy(path: str, request: Request) -> Response:
             streamed = await _stream(fresh, full, request, headers, body)
         # Only drop the mapping once the fleet has actually accepted the
         # delete; otherwise a retry cannot find the job it failed to cancel.
-        if request.method == "DELETE" and streamed.status_code < 400:
+        #
+        # A DELETE on ".../content" is an ARTIFACT ACK, not a cancellation:
+        # the job still exists and stays pollable, so forgetting its owner
+        # here would force a fan-out re-probe on the next poll of a job we
+        # already know the home of.
+        if request.method == "DELETE" and streamed.status_code < 400 and not is_content(full):
             table.forget(job_id)
         return streamed
 
@@ -532,17 +634,19 @@ async def proxy(path: str, request: Request) -> Response:
         route = table.resolve(model, task or None)
     except RoutingError as exc:
         # Understood and refused — a client error, not something to retry.
+        _log(f"routing refused: model={model!r} task={task!r}: {exc}")
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
     try:
         resp = await client.request(
             request.method,
             f"{route.url}{full}",
-            headers={**headers, **_content_headers(request)},
+            headers={**headers, **content_headers(request)},
             content=body or None,
             params=dict(request.query_params),
         )
     except httpx.HTTPError as exc:
+        _log(f"fleet {route.profile} unreachable on {request.method} {full}: {exc!r}")
         return JSONResponse(
             {"detail": f"fleet {route.profile} unreachable: {exc}"}, status_code=502
         )
@@ -552,27 +656,31 @@ async def proxy(path: str, request: Request) -> Response:
     return Response(
         content=resp.content,
         status_code=resp.status_code,
-        headers=_safe_headers(resp.headers),
+        headers=safe_headers(resp.headers),
         media_type=resp.headers.get("content-type"),
     )
 
 
 async def _find_owner(job_id: str, path: str, headers: dict) -> str | None:
-    """Ask each fleet whether it holds this job, after a gateway restart.
+    """Which fleet holds this job? Needed after a gateway restart.
 
-    Always probed with the job's STATUS path, never the caller's: probing
-    ".../{id}/content" would pull the full MP4 from every fleet, buffered,
-    only to learn which one owns it.
+    Raises AmbiguousOwner on a CONFLICT — two fleets claiming one bare id,
+    or one claiming it while another could not be reached. That used to
+    return None here, which the caller renders as 404: "unknown, safe to
+    resubmit", the opposite of the truth, billing the generation twice.
     """
-    head, _, _ = path.partition(f"/{job_id}")
-    path = f"{head}/{job_id}"
-    for route in table.routes:
-        with contextlib.suppress(httpx.HTTPError):
-            r = await client.get(f"{route.url}{path}", headers=headers)
-            if r.status_code < 400:
-                table.remember(job_id, route.url)
-                return route.url
-    return None
+    found = await find_owner(
+        job_id,
+        path,
+        headers,
+        candidates=[route.url for route in table.routes],
+        client=ctl,
+        log=_log,
+    )
+    if found is None:
+        return None
+    table.remember(job_id, found[0])
+    return found[0]
 
 
 async def _stream(target: str, path: str, request: Request, headers: dict, body: bytes) -> Response:
@@ -588,16 +696,23 @@ async def _stream(target: str, path: str, request: Request, headers: dict, body:
         resp = await client.send(req, stream=True)
     except httpx.HTTPError as exc:
         return JSONResponse({"detail": f"fleet unreachable: {exc}"}, status_code=502)
+    # The balancer stamps every job-scoped response with the EFFECTIVE job
+    # id. Learning it here is what keeps real ids out of the owner probe:
+    # POST responses only ever taught the gateway TICKET ids, so every
+    # queued job's post-handover polls and final download used to resolve
+    # by unverified fan-out.
+    effective = resp.headers.get("x-deepme-job-id")
+    if effective and resp.status_code < 400:
+        # Only a SUCCESSFUL response is evidence of ownership. Remembering
+        # on an error bound the id to a fleet that had just denied it.
+        table.remember(effective, target)
     from starlette.background import BackgroundTask
 
     return StreamingResponse(
-        resp.aiter_raw(),
+        # Decoded, because _safe_headers strips content-encoding — raw
+        # bytes with the header gone are undecodable garbage downstream.
+        resp.aiter_bytes(),
         status_code=resp.status_code,
-        headers=_safe_headers(resp.headers),
+        headers=safe_headers(resp.headers),
         background=BackgroundTask(resp.aclose),
     )
-
-
-def _content_headers(request: Request) -> dict[str, str]:
-    ct = request.headers.get("content-type")
-    return {"content-type": ct} if ct else {}

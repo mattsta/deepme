@@ -59,7 +59,7 @@ class _Spec:
 def captured(monkeypatch):
     seen = {}
 
-    def fake_submit(spec, body, timeout):
+    def fake_submit(spec, body):
         seen.update(body)
         return {"id": "vid_1", "status": "failed", "error": {"stop": "here"}}
 
@@ -102,7 +102,7 @@ class _Floored(_Spec):
 
 def test_a_step_count_below_the_models_floor_fails_before_submitting(captured):
     """steps=1 makes a 1-point sigma schedule; the server blames the schedule."""
-    with pytest.raises(SystemExit, match="below this model's floor of 2"):
+    with pytest.raises(media.RequestInvalid, match="below this model's floor of 2"):
         media.generate_video(_Floored(), "a cat", steps=1)  # type: ignore[arg-type]
     assert not captured, "must not reach the server"
 

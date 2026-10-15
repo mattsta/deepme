@@ -1,5 +1,21 @@
 """One physical copy of a model's offloaded weights, shared by every replica.
 
+WHAT ACTUALLY RUNS ON THE SERVER IS `hooks/deepme_hooks.py`, NOT THIS FILE.
+Only `usage()`, `orphans()`, `clear()` and `main()` are live — `deepme store
+status|clear` pushes this module as a standalone admin tool. The acquisition
+half below (`buffer_key`, `paths`, `acquire`, `publish`, `_fresh`, `_flock`,
+`Acquired`, `enabled`, `verifying`) is NOT deployed and does not describe the
+deployed scheme: the hook keys buffers WITHOUT tp_rank and without the tensor
+layout, and writes `{key}.bin` with NO `.ready` marker and NO `.lock` — it is
+safe by a different argument (the fill copy always re-runs, so readiness
+detection is unnecessary). Trusting the protocol described here would be
+trusting a contract nothing implements.
+
+The on-disk contract, stated once, here: files are `{key}.bin` under
+STORE_DIR, keyed by the hook's scheme. `usage`/`orphans`/`clear` are written
+against THAT, not against the `.ready`/`.lock` layout below.
+
+
 Layerwise offload keeps weights in host RAM as one flat pinned buffer per
 (layer, dtype). Pinned memory is page-locked into ONE process, so N replicas
 of the same model hold N identical private copies — measured at 96GiB per

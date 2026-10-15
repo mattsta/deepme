@@ -201,3 +201,36 @@ def test_ticket_ids_carry_the_queue_salt():
     assert ta.ticket_id != tb.ticket_id
     assert ta.ticket_id.startswith("q_video-ab12-")
     assert tb.ticket_id.startswith("q_ref-cd34-")
+
+
+def test_listing_positions_costs_one_sort_not_one_per_ticket():
+    """Asking position() per ticket re-sorted the whole queue each time —
+    O(n^2 log n) with no await in the loop, which pinned the event loop for
+    seconds at the prune bound and made a healthy fleet read as down."""
+    q = AdmissionQueue()
+    for i in range(50):
+        q.enqueue({"n": i}, priority=i % 3)
+    by_id = q.positions()
+    ordered = q.waiting()
+    assert len(by_id) == 50
+    assert [by_id[t.ticket_id] for t in ordered] == list(range(50))
+    # positions() must agree with the per-ticket answer it replaces.
+    for t in ordered:
+        assert q.position(t.ticket_id) == by_id[t.ticket_id]
+
+
+def test_next_ready_is_the_queue_head_without_sorting():
+    q = AdmissionQueue()
+    low = q.enqueue({"n": 1}, priority=9)
+    high = q.enqueue({"n": 2}, priority=0)
+    q.enqueue({"n": 3}, priority=5)
+    assert q.next_ready().ticket_id == high.ticket_id
+    q.claim(high.ticket_id)
+    assert q.next_ready().priority == 5
+    assert low.state == "waiting"
+
+
+def test_equal_priority_stays_strictly_fifo():
+    q = AdmissionQueue()
+    ids = [q.enqueue({"n": i}, priority=5).ticket_id for i in range(20)]
+    assert [t.ticket_id for t in q.waiting()] == ids

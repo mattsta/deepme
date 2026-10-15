@@ -3,6 +3,51 @@
 Procedures for running the deepme inference platform. All commands run from
 this repo (`uv sync` once). Every operation is idempotent unless noted.
 
+## 0. Full restart / redeploy — THE sequence
+
+Use this after changing anything a running process froze in: a profile's
+`[serve.env]` or `engine_args`, the balancer/gateway source, the port
+registry, or the pricing/economics table. **Bottom-up, always** — replicas,
+then the balancer that fronts them, then the gateway that routes to it.
+
+```sh
+uv run deepme capacity                                  # what is running now
+uv run deepme serve scale -m h3-video -n 4 --force      # 1. replicas  (~6 min)
+uv run deepme balancer start -m h3-video --force        # 2. balancer  (~1 min)
+uv run deepme gateway start                             # 3. gateway   (seconds)
+uv run deepme capacity                                  # verify: free N, accepting
+uv run deepme top                                       # verify: jobs visible
+```
+
+**`serve restart` does NOT apply env or engine-arg changes.** It is a bare
+`systemctl restart`, so the unit file — and the `Environment=` lines frozen
+into it — are reused. Only `serve scale` (or `serve start`) re-renders the
+unit. Restarting the wrong way looks like it worked and silently changes
+nothing; this cost a real debugging cycle.
+
+`--force` skips the drain guard, which refuses to stop replicas with work in
+flight. Without it the commands are safe to run any time; with it you are
+deliberately killing in-flight generations. Server-side jobs do not stop when
+a _client_ is cancelled, so check `capacity` first unless you mean to.
+
+The balancer takes up to ~30s to answer after `balancer start`: it rebuilds
+occupancy from replica truth before binding its port, so `capacity` may
+report the fleet `unreachable` briefly. That is expected; if it persists, read
+`uv run deepme balancer logs -m h3-video`.
+
+Restarting the balancer destroys **waiting queue tickets** (they live in its
+memory); running jobs survive on their replicas and are re-adopted. Clients
+holding a ticket resubmit automatically.
+
+Related, narrower operations:
+
+| you changed                          | run                                                                        |
+| ------------------------------------ | -------------------------------------------------------------------------- |
+| balancer/gateway source only         | steps 2-3                                                                  |
+| gateway routes only (after a resize) | `uv run deepme gateway start`                                              |
+| the fleet MIX (which models run)     | `uv run deepme fleet switch <mix>` — drains and converges, no full restart |
+| a guard policy                       | `uv run deepme guard start`                                                |
+
 ## 1. Fresh server bring-up
 
 ```sh
@@ -68,6 +113,21 @@ facts in README ("Hard-won toolchain facts") before changing anything.
   ≤60s (reconcile → revive → pump); `deepme top` shows what every job is,
   `deepme job-progress <id>` one job's stage. Stuck beyond that: §7.5's
   reconcile — re-running the same `fleet switch` converges from any state.
+- **"my job is queued forever"**: read `accepting_replicas`, not elapsed
+  time. `deepme capacity --json` — `accepting_replicas: 0` with replicas
+  attached means every replica is unhealthy or draining, so the queue can
+  never drain; anything above 0 means the wait is real work and must not be
+  killed. The balancer fails waiting tickets itself after `FLEET_DEAD_STRIKES`
+  (default 30) consecutive 10s beats at zero accepting replicas, so a genuine
+  outage self-resolves into `failed`/`billable: false` rather than an
+  indefinite hang. Any replica returning resets the count. Raise the env var
+  for a migration expected to exceed 5 minutes; set it to `0` to disable.
+  Watch `deepme_submit_unservable_total` — non-zero means callers were
+  refused because the fleet was dead, not because their work was bad.
+- **`generate`/`batch` exits immediately saying nothing can serve it**: that
+  is the preflight, and it is reading `/v1/capacity`. Confirm with
+  `deepme capacity`; if replicas are attached but not accepting, the fix is
+  §0's restart sequence, not retrying the command.
 - `/v1/pricing` returning `503 "no pricing table"`: operator condition —
   `deepme gateway start` (or a reload) republishes it. (§7.8)
 - Never `serve stop`/`scale` a profile with jobs or queue: the guard
@@ -327,11 +387,17 @@ uv run deepme artifacts audit -m <p>     # what's on the work volume
 uv run deepme artifacts sweep -m <p> --older-than-hours 48   # manual override
 ```
 
-Artifact RETENTION is automatic (balancer maintenance loop): 6h for
-never-fetched outputs, 1h after the first fetch, running jobs untouchable;
-`inputs/` uploads follow the 6h rule. `/balancer/stats` carries the
-`retention` counters; `capacity` carries `disk` with an 0.85 watermark.
+Artifacts are reclaimed when the CLIENT ACKS (`DELETE .../content`, which the
+CLI sends after fsync+rename), with the maintenance loop as the backstop: 1h
+after first delivery if never acked, 6h if never fetched, running jobs
+untouchable; `inputs/` uploads follow the 6h rule. `/balancer/stats` carries
+the `retention` counters; `capacity` carries `disk` with an 0.85 watermark.
 The sweep command is the manual override, dry-run by default.
+
+If `artifacts audit` shows disk climbing, the question is WHOSE fault: many
+delivered-but-unacked files means clients are fetching and not acking (or
+dying mid-write) — they clear within the hour but indicate a broken consumer;
+many never-fetched files means nobody is collecting at all.
 
 Prices derive from `deploy/economics.toml` × measured occupancy and FREEZE
 into the gateway at start/reload — `deepme econ` warns when the live table
