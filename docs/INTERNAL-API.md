@@ -663,7 +663,9 @@ Measured: ~800s for a 5s clip at the default schedule (50 sigma points →
 49 denoise iterations; both numbers appear in logs) (superlinear in
 duration — 15s costs 1.51× linear); four concurrent clips in 18m28s
 against ~62m serial. Roughly **17 clips/hour, ~170 overnight** at four
-replicas. Cost is linear in `num_inference_steps`.
+replicas. Cost is linear in `num_inference_steps`. Per-length timing and
+throughput tables are in [VIDEO-ARCHITECTURE.md](VIDEO-ARCHITECTURE.md)
+§4–5.
 
 Operators change the mix with `deepme fleet switch <name>` — delta-aware:
 unchanged replicas keep serving, leavers drain (running jobs finish),

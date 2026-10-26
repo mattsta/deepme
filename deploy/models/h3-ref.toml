@@ -30,8 +30,9 @@ engine = "sglang"
 # partition (h3-video).
 tasks = ["ref2va"]
 tp = 2
-# The other free pair, so this can run alongside h3-video if wanted — though
-# two offloaded H3 deployments together need ~250GB of host RAM.
+# The other free pair, so this can run alongside h3-video if wanted. Host RAM
+# is not the limit once both profiles use the shared store (env below): the
+# text encoder and audio VAE are held once across both partitions.
 gpus = [4, 5]
 port = 8031
 max_len = 131072
@@ -40,6 +41,29 @@ kv_ram_gb = 0
 spec_decode = false
 
 [serve.env]
+# Same production env as h3-video.toml, for the same measured reasons — see
+# the comments there and docs/VIDEO-ARCHITECTURE.md §3. Until 2026-10-26 this
+# section was empty, and the runs ledger shows the production h3-ref replica
+# ran that way (private streamer load, private offload buffers). These
+# settings were never exercised on Ref2VA itself; the first deploy with them
+# should confirm the `deepme store status` segments show the shared
+# components mapped by both profiles.
+
+# mmap shards into the shared page cache instead of staging every file into
+# private memory per rank (~230GiB transient per replica on h3-video).
+SGLANG_USE_RUNAI_MODEL_STREAMER = "0"
+
+# Back offload buffers with the content-addressed /dev/shm store. Ref2VA's
+# text encoder and audio VAE are byte-identical to FL2VA's, so a mixed fleet
+# maps ONE copy of them; only this partition's transformer is added. Requires
+# `deepme patches install-hooks`; inert if unset.
+DEEPME_SHARED_WEIGHTS = "1"
+
+# Grow allocator segments in place. Measured need on h3-video at 15s (a 2.92GiB
+# allocation failed with 6.02GiB stranded in the allocator). ref2va peaks
+# HIGHER than t2va at equal length (25.8GiB vs ~22.8GiB for 5s), so it has
+# less fragmentation headroom, not more.
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 
 [serve.engine_args]
 vllm = []

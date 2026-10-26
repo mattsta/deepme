@@ -232,7 +232,9 @@ Verify with `deepme generate` (produces a real file), not just health.
 
 Media engines serve ONE request at a time, so throughput comes from running
 several copies. Measured on 8x32GiB: four H3 replicas in 172GiB of host RAM,
-four concurrent clips in 18m28s against ~62m serial (3.4x).
+four concurrent clips in 18m28s against ~62m serial (3.4x). Per-clip time is
+flat from 1 to 4 concurrent clips at every clip length; the full breakdown is
+in [VIDEO-ARCHITECTURE.md](VIDEO-ARCHITECTURE.md) §5.
 
 ```sh
 uv run deepme plan                       # what fits in the free space now
@@ -356,7 +358,9 @@ uv run deepme patches remove-hooks    # back to stock engine (incident escape)
 ```
 
 Enabled per deployment by `DEEPME_SHARED_WEIGHTS = "1"` in the profile's
-`[serve.env]`. Unset means stock behaviour — the hook is inert.
+`[serve.env]`. Unset means stock behaviour — the hook is inert. How the store,
+mmap loading and content keys fit together is in
+[VIDEO-ARCHITECTURE.md](VIDEO-ARCHITECTURE.md) §3.
 
 **After an sglang upgrade**, in order:
 

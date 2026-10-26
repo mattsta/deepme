@@ -32,7 +32,10 @@ submit/follow/queue/pricing/observability) ·
 [docs/INVARIANTS.md](docs/INVARIANTS.md) (every self-management guarantee,
 with where it is enforced and tested) ·
 [docs/USER-GUIDE.md](docs/USER-GUIDE.md) (client API usage: chat,
-streaming, tools, guard controls, and video generation).
+streaming, tools, guard controls, and video generation) ·
+[docs/VIDEO-ARCHITECTURE.md](docs/VIDEO-ARCHITECTURE.md) (how the video
+model is placed across PCIe-only GPUs, the shared weight-memory design, and
+measured timing/concurrency by clip length).
 
 ## Cold start → serving (fresh system runbook)
 
